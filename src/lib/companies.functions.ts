@@ -18,11 +18,11 @@ export const createCompany = createServerFn({ method: "POST" })
       .parse(d),
   )
   .handler(async ({ data, context }) => {
-    const { supabase } = context;
+    const { supabase, userId } = context;
     const { data: company, error } = await supabase
       .from("companies")
       .insert({
-        owner_id: "00000000-0000-0000-0000-000000000001",
+        owner_id: userId,
         name: data.name,
         website: data.website || null,
         industry: data.industry || null,
@@ -40,6 +40,7 @@ export const listCompanies = createServerFn({ method: "GET" })
     const { data, error } = await context.supabase
       .from("companies")
       .select("*")
+      .eq("owner_id", context.userId)
       .order("created_at", { ascending: false });
     if (error) throw new Error(error.message);
     return { companies: data ?? [] };
