@@ -90,7 +90,8 @@ export async function runAgentAssessment(opts: {
 
   const content = await callAI({ system, user, json: true });
   try {
-    const parsed = JSON.parse(content);
+    const cleaned = content.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+    const parsed = JSON.parse(cleaned);
     return {
       summary: parsed.summary ?? "",
       findings: parsed.findings ?? {},
