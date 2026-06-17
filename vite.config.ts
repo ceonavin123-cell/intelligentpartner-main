@@ -10,7 +10,11 @@ export default defineConfig({
     tanstackStart({
       server: { entry: "src/server.ts" },
     }),
-    nitro(),
+    nitro({
+      rollupConfig: {
+        external: ["undici"],
+      },
+    }),
     react(),
     tailwindcss(),
     tsconfigPaths(),
