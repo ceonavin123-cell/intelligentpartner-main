@@ -172,7 +172,34 @@ function CompanyWorkspace() {
                       <Brain className="h-3 w-3 mr-1 animate-pulse" /> Researching…
                     </div>
                   ) : (
-                    <AgentCard assessment={a} />
+                    <>
+                      <p className="text-sm whitespace-pre-wrap line-clamp-6">{a.summary}</p>
+                      {(() => {
+                        let f = a.findings ?? {};
+                        if (typeof f === "string") try { f = JSON.parse(f); } catch {}
+                        return Object.keys(f).length > 0 ? (
+                          <details className="mt-3">
+                            <summary className="text-xs cursor-pointer text-muted-foreground">
+                              View findings
+                            </summary>
+                            <div className="mt-2 space-y-2 text-xs">
+                              {["strengths", "risks", "opportunities", "key_questions"].map((k) =>
+                                Array.isArray(f[k]) && f[k].length > 0 ? (
+                                  <div key={k}>
+                                    <div className="font-semibold capitalize">{k.replace("_", " ")}</div>
+                                    <ul className="list-disc list-inside text-muted-foreground">
+                                      {f[k].map((it: string, i: number) => (
+                                        <li key={i}>{it}</li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                ) : null,
+                              )}
+                            </div>
+                          </details>
+                        ) : null;
+                      })()}
+                    </>
                   )}
                 </Card>
               );
@@ -931,77 +958,6 @@ function RiskOverview({ assessments }: { assessments: any[] }) {
         </ResponsiveContainer>
       </div>
     </Card>
-  );
-}
-
-const FINDING_META: Record<string, { label: string; color: string; bg: string; icon: any }> = {
-  strengths: { label: "Strengths", color: "text-emerald-600", bg: "bg-emerald-500/10", icon: CheckCircle2 },
-  risks: { label: "Risks", color: "text-rose-600", bg: "bg-rose-500/10", icon: AlertTriangle },
-  opportunities: { label: "Opportunities", color: "text-blue-600", bg: "bg-blue-500/10", icon: Lightbulb },
-  key_questions: { label: "Key Questions", color: "text-amber-600", bg: "bg-amber-500/10", icon: HelpCircle },
-};
-
-function AgentCard({ assessment }: { assessment: any }) {
-  const [openSection, setOpenSection] = useState<string | null>(null);
-  const a = assessment;
-  let findings = a.findings ?? {};
-  if (typeof findings === "string") {
-    try { findings = JSON.parse(findings); } catch { findings = {}; }
-  }
-  const totalFindings = Object.values(findings).reduce(
-    (sum: number, arr: any) => sum + (Array.isArray(arr) ? arr.length : 0), 0
-  );
-
-  const riskColor =
-    a.risk_score >= 70 ? "text-rose-600 bg-rose-500/10" :
-    a.risk_score >= 40 ? "text-amber-600 bg-amber-500/10" :
-    "text-emerald-600 bg-emerald-500/10";
-
-  return (
-    <div className="space-y-3">
-      <p className="text-sm leading-relaxed">{a.summary}</p>
-
-      {totalFindings > 0 && (
-        <div className="flex flex-wrap gap-1.5">
-          {Object.entries(FINDING_META).map(([key, meta]) => {
-            const items = findings[key];
-            if (!Array.isArray(items) || items.length === 0) return null;
-            return (
-              <button
-                key={key}
-                onClick={() => setOpenSection(openSection === key ? null : key)}
-                className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium transition-colors ${meta.bg} ${meta.color} ${openSection === key ? "ring-1 ring-current" : "hover:opacity-80"}`}
-              >
-                <meta.icon className="h-3 w-3" />
-                {meta.label} ({items.length})
-              </button>
-            );
-          })}
-        </div>
-      )}
-
-      {openSection && FINDING_META[openSection] && findings[openSection] && (
-        <div className="rounded-lg border bg-card/50 p-3 space-y-2">
-          <div className={`text-xs font-semibold ${FINDING_META[openSection].color}`}>
-            {FINDING_META[openSection].label}
-          </div>
-          <ul className="space-y-1.5">
-            {findings[openSection].map((item: string, i: number) => (
-              <li key={i} className="flex gap-2 text-xs text-muted-foreground leading-relaxed">
-                <span className="shrink-0 mt-0.5 h-1.5 w-1.5 rounded-full bg-current opacity-40" />
-                {item}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {!openSection && totalFindings > 0 && (
-        <p className="text-[11px] text-muted-foreground">
-          Click a category above to view details
-        </p>
-      )}
-    </div>
   );
 }
 
