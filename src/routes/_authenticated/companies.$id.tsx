@@ -944,7 +944,10 @@ const FINDING_META: Record<string, { label: string; color: string; bg: string; i
 function AgentCard({ assessment }: { assessment: any }) {
   const [openSection, setOpenSection] = useState<string | null>(null);
   const a = assessment;
-  const findings = a.findings ?? {};
+  let findings = a.findings ?? {};
+  if (typeof findings === "string") {
+    try { findings = JSON.parse(findings); } catch { findings = {}; }
+  }
   const totalFindings = Object.values(findings).reduce(
     (sum: number, arr: any) => sum + (Array.isArray(arr) ? arr.length : 0), 0
   );
