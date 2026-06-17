@@ -1,4 +1,3 @@
-import Firecrawl from "@mendable/firecrawl-js";
 import { callAI } from "./research.server";
 
 export type ScrapedJob = {
@@ -23,6 +22,7 @@ const CATEGORIES = [
 export async function scrapeJobs(): Promise<ScrapedJob[]> {
   const key = process.env.FIRECRAWL_API_KEY;
   if (!key) throw new Error("FIRECRAWL_API_KEY missing");
+  const { default: Firecrawl } = await import("@mendable/firecrawl-js");
   const fc = new Firecrawl({ apiKey: key });
 
   type Snippet = { source: string; url: string; title: string; description: string };

@@ -1,4 +1,3 @@
-import Firecrawl from "@mendable/firecrawl-js";
 import { AGENTS, type AgentKey } from "@/lib/agents";
 import { aiChat, type AIProvider } from "@/lib/ai-providers";
 
@@ -31,6 +30,7 @@ export async function researchCompany(opts: {
 }): Promise<ResearchBundle> {
   const key = process.env.FIRECRAWL_API_KEY;
   if (!key) throw new Error("FIRECRAWL_API_KEY missing");
+  const { default: Firecrawl } = await import("@mendable/firecrawl-js");
   const fc = new Firecrawl({ apiKey: key });
 
   let websiteMarkdown = "";
