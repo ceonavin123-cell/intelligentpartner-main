@@ -174,31 +174,7 @@ function CompanyWorkspace() {
                   ) : (
                     <>
                       <p className="text-sm whitespace-pre-wrap line-clamp-6">{a.summary}</p>
-                      {(() => {
-                        let f = a.findings ?? {};
-                        if (typeof f === "string") try { f = JSON.parse(f); } catch {}
-                        return Object.keys(f).length > 0 ? (
-                          <details className="mt-3">
-                            <summary className="text-xs cursor-pointer text-muted-foreground">
-                              View findings
-                            </summary>
-                            <div className="mt-2 space-y-2 text-xs">
-                              {["strengths", "risks", "opportunities", "key_questions"].map((k) =>
-                                Array.isArray(f[k]) && f[k].length > 0 ? (
-                                  <div key={k}>
-                                    <div className="font-semibold capitalize">{k.replace("_", " ")}</div>
-                                    <ul className="list-disc list-inside text-muted-foreground">
-                                      {f[k].map((it: string, i: number) => (
-                                        <li key={i}>{it}</li>
-                                      ))}
-                                    </ul>
-                                  </div>
-                                ) : null,
-                              )}
-                            </div>
-                          </details>
-                        ) : null;
-                      })()}
+                      <AgentFindings findings={a.findings} />
                     </>
                   )}
                 </Card>
@@ -958,6 +934,47 @@ function RiskOverview({ assessments }: { assessments: any[] }) {
         </ResponsiveContainer>
       </div>
     </Card>
+  );
+}
+
+const FINDING_META: Record<string, { label: string; icon: string; color: string; bg: string }> = {
+  strengths: { label: "Strengths", icon: "✅", color: "text-emerald-700", bg: "bg-emerald-50 border-emerald-200" },
+  risks: { label: "Risks", icon: "⚠️", color: "text-rose-700", bg: "bg-rose-50 border-rose-200" },
+  opportunities: { label: "Opportunities", icon: "💡", color: "text-blue-700", bg: "bg-blue-50 border-blue-200" },
+  key_questions: { label: "Key Questions", icon: "❓", color: "text-amber-700", bg: "bg-amber-50 border-amber-200" },
+};
+
+function AgentFindings({ findings }: { findings: any }) {
+  let f = findings ?? {};
+  if (typeof f === "string") try { f = JSON.parse(f); } catch { f = {}; }
+
+  const sections = ["strengths", "risks", "opportunities", "key_questions"].filter(
+    (k) => Array.isArray(f[k]) && f[k].length > 0
+  );
+
+  if (sections.length === 0) return null;
+
+  return (
+    <div className="mt-3 space-y-3">
+      {sections.map((k) => {
+        const meta = FINDING_META[k];
+        return (
+          <div key={k} className={`rounded-lg border p-3 ${meta.bg}`}>
+            <div className={`text-xs font-semibold mb-2 ${meta.color}`}>
+              {meta.icon} {meta.label} ({f[k].length})
+            </div>
+            <ul className="space-y-1.5">
+              {f[k].map((item: string, i: number) => (
+                <li key={i} className="text-xs text-muted-foreground leading-relaxed flex gap-2">
+                  <span className="shrink-0 mt-0.5 h-1.5 w-1.5 rounded-full bg-current opacity-30" />
+                  {item}
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
