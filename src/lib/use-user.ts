@@ -1,15 +1,24 @@
+import { useState, useEffect } from "react";
 import type { User } from "@supabase/supabase-js";
+import { supabase } from "@/integrations/supabase/client";
 
 export function useUser() {
-  const mockUser: User = {
-    id: "00000000-0000-0000-0000-000000000000",
-    email: "developer@studio.local",
-    role: "authenticated",
-    aud: "authenticated",
-    created_at: new Date().toISOString(),
-    app_metadata: {},
-    user_metadata: { full_name: "Developer User" },
-  } as any;
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
 
-  return { user: mockUser, loading: false };
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
+      setLoading(false);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+      setLoading(false);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  return { user, loading };
 }

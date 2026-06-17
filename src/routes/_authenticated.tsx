@@ -37,9 +37,16 @@ function AuthLayout() {
           </Link>
           <div className="flex items-center gap-3">
             <span className="text-sm text-muted-foreground">{user?.email}</span>
-            <span className="inline-flex items-center rounded-md bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-500 ring-1 ring-inset ring-amber-500/20">
-              Developer Mode (Auth Bypassed)
-            </span>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={async () => {
+                await supabase.auth.signOut();
+                router.navigate({ to: "/auth" });
+              }}
+            >
+              Sign out
+            </Button>
           </div>
         </div>
       </header>
