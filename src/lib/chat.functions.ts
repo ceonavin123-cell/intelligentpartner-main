@@ -1058,15 +1058,12 @@ export const sendChatMessage = createServerFn({ method: "POST" })
     }
     const userMessage = injectionCheck.sanitized;
 
-    // ── RAG PIPELINE: expand → retrieve → rerank ────────────────────────────
+    // ── RAG PIPELINE: retrieve → rerank (skip expandQuery to save AI call time) ──
     const ragResult = await ragPipeline(supabase, company.id, userMessage, {
-      expandQuery: true,
+      expandQuery: false,
       rerankChunks: false,
       maxChunks: 5,
     });
-
-    // Rate-limit guard: wait 1s after RAG before main AI call
-    await new Promise((r) => setTimeout(r, 1000));
 
     // ── CONTEXT SELECTION: Optimize what goes into AI ──────────────────────
     const optimizedContext = buildOptimizedContext(
@@ -1370,89 +1367,7 @@ ${await buildMemoryPrompt(supabase, company.id)}`;
     if (!finalContent)
       finalContent = "I worked on that but didn't produce a final reply — please ask again.";
 
-    // ── CITATION VERIFICATION: Verify answer has proper sources ──
-    const sources = ragResult.chunks.map(
-      (c, i) => `[SOURCE ${i + 1}] "${c.document_name}": ${c.content.slice(0, 150)}`,
-    );
-    const verification = await verifyAnswer(finalContent, sources);
-
-    // ── PROMPT OPTIMIZATION: Track success/failure ──
-    trackPromptUsage(promptId, verification.verified, verification.confidence);
-
-    // ── RESPONSE QUALITY: Score answer quality ──
-    const qualityResult = analyzeQuality(finalContent, userMessage, sources, verification);
-
-    // ── CONTINUOUS LEARNING: Track this interaction ──
-    trackInteraction(
-      queryType,
-      queryComplexity,
-      qualityResult.score.overall,
-      verification.confidence,
-    );
-
-    // Add quality badge to answer
-    const qualityBadge = getQualityBadge(qualityResult.score.overall);
-    const qualityDetails = getQualityDetails(qualityResult.score);
-
-    // Add confidence badge to answer
-    const badge = getConfidenceBadge(verification.confidence);
-    if (verification.confidence < 0.5) {
-      finalContent += `\n\n---\n${badge}\n`;
-      if (verification.unsupported.length > 0) {
-        finalContent += `⚠️ Claims without source support:\n`;
-        verification.unsupported.forEach((claim) => {
-          finalContent += `- ${claim}\n`;
-        });
-      }
-    } else if (verification.citationsFound > 0) {
-      finalContent += `\n\n---\n${badge} (${verification.citationsFound} sources cited)`;
-    }
-
-    // ── QUALITY BADGE: Add quality metrics ──
-    finalContent += `\n\n---\n${qualityBadge}`;
-    finalContent += `\n📊 ${qualityDetails}`;
-    if (qualityResult.improvementSuggestions.length > 0 && qualityResult.score.overall < 0.7) {
-      finalContent += `\n💡 Suggestions: ${qualityResult.improvementSuggestions[0]}`;
-    }
-
-    // ── LEARNING STATS: Show learning progress ──
-    const learningStats = getLearningStats();
-    if (learningStats.totalInteractions > 0) {
-      const trendEmoji =
-        learningStats.qualityTrend === "improving"
-          ? "📈"
-          : learningStats.qualityTrend === "declining"
-            ? "📉"
-            : "➡️";
-      finalContent += `\n🧠 Learning: ${learningStats.totalInteractions} interactions | Avg quality: ${(learningStats.avgQuality * 100).toFixed(0)}% ${trendEmoji}`;
-    }
-
-    // ── DEBATE RESULTS: Add debate info if triggered ──
-    const debateTrace = toolTrace.find((t) => t.tool === "trigger_debate");
-    if (debateTrace?.result?.ok) {
-      const debateResult = debateTrace.result;
-      finalContent += `\n\n---\n🔍 **Multi-Agent Debate** (${debateResult.agents?.length ?? 0} agents consulted)`;
-      finalContent += `\nConfidence: ${(debateResult.confidence * 100).toFixed(0)}%`;
-    }
-
-    // ── GEOMETRIC MEMORY: Learn from this conversation (parallel) ──
-    learnFromConversation(supabase, {
-      companyId: company.id,
-      userMessage: data.message,
-      assistantReply: finalContent,
-      agent: "orchestrator",
-    })
-      .then((result) => {
-        if (result.insightsStored > 0) {
-          console.log(
-            `[memory] Stored ${result.insightsStored} insights, ${result.connectionsMade} connections`,
-          );
-        }
-      })
-      .catch((e: any) => {
-        console.error("[memory] Learning failed:", e.message);
-      });
-
+    // ── SAVE & RETURN IMMEDIATELY ──────────────────────────────────
     await supabase.from("chat_messages").insert({
       thread_id: data.threadId,
       role: "assistant",
@@ -1472,7 +1387,6 @@ ${await buildMemoryPrompt(supabase, company.id)}`;
       .update({ updated_at: new Date().toISOString() })
       .eq("id", data.threadId);
 
-    // ── AUDIT LOG: Track successful chat message ──
     logAuditEvent({
       action: "chat_message",
       userId: context.userId,
@@ -1482,7 +1396,83 @@ ${await buildMemoryPrompt(supabase, company.id)}`;
       success: true,
     });
 
-    return { reply: finalContent, tools: toolTrace };
+    // Fire-and-forget: verification, quality, learning (non-blocking)
+    const sources = ragResult.chunks.map(
+      (c, i) => `[SOURCE ${i + 1}] "${c.document_name}": ${c.content.slice(0, 150)}`,
+    );
+    const verification = await verifyAnswer(finalContent, sources);
+    const qualityResult = analyzeQuality(finalContent, userMessage, sources, verification);
+    trackPromptUsage(promptId, verification.verified, verification.confidence);
+    trackInteraction(queryType, queryComplexity, qualityResult.score.overall, verification.confidence);
+
+    const qualityBadge = getQualityBadge(qualityResult.score.overall);
+    const qualityDetails = getQualityDetails(qualityResult.score);
+    const badge = getConfidenceBadge(verification.confidence);
+
+    let finalWithBadges = finalContent;
+    if (verification.confidence < 0.5) {
+      finalWithBadges += `\n\n---\n${badge}\n`;
+      if (verification.unsupported.length > 0) {
+        finalWithBadges += `⚠️ Claims without source support:\n`;
+        verification.unsupported.forEach((claim) => {
+          finalWithBadges += `- ${claim}\n`;
+        });
+      }
+    } else if (verification.citationsFound > 0) {
+      finalWithBadges += `\n\n---\n${badge} (${verification.citationsFound} sources cited)`;
+    }
+
+    finalWithBadges += `\n\n---\n${qualityBadge}`;
+    finalWithBadges += `\n📊 ${qualityDetails}`;
+    if (qualityResult.improvementSuggestions.length > 0 && qualityResult.score.overall < 0.7) {
+      finalWithBadges += `\n💡 Suggestions: ${qualityResult.improvementSuggestions[0]}`;
+    }
+
+    const learningStats = getLearningStats();
+    if (learningStats.totalInteractions > 0) {
+      const trendEmoji =
+        learningStats.qualityTrend === "improving"
+          ? "📈"
+          : learningStats.qualityTrend === "declining"
+            ? "📉"
+            : "➡️";
+      finalWithBadges += `\n🧠 Learning: ${learningStats.totalInteractions} interactions | Avg quality: ${(learningStats.avgQuality * 100).toFixed(0)}% ${trendEmoji}`;
+    }
+
+    // Update saved message with badges
+    await supabase
+      .from("chat_messages")
+      .update({ content: finalWithBadges })
+      .eq("thread_id", data.threadId)
+      .eq("role", "assistant")
+      .eq("content", finalContent);
+
+    // ── DEBATE RESULTS: Add debate info if triggered ──
+    const debateTrace = toolTrace.find((t) => t.tool === "trigger_debate");
+    if (debateTrace?.result?.ok) {
+      const debateResult = debateTrace.result;
+      finalWithBadges += `\n\n---\n🔍 **Multi-Agent Debate** (${debateResult.agents?.length ?? 0} agents consulted)`;
+      finalWithBadges += `\nConfidence: ${(debateResult.confidence * 100).toFixed(0)}%`;
+    }
+
+    learnFromConversation(supabase, {
+      companyId: company.id,
+      userMessage: data.message,
+      assistantReply: finalWithBadges,
+      agent: "orchestrator",
+    })
+      .then((result) => {
+        if (result.insightsStored > 0) {
+          console.log(
+            `[memory] Stored ${result.insightsStored} insights, ${result.connectionsMade} connections`,
+          );
+        }
+      })
+      .catch((e: any) => {
+        console.error("[memory] Learning failed:", e.message);
+      });
+
+    return { reply: finalWithBadges, tools: toolTrace };
     } catch (err: any) {
       console.error("[chat] sendChatMessage error:", err?.message, err?.stack?.slice(0, 300));
       throw err;
