@@ -186,7 +186,7 @@ export async function aiComplete(options: AICompletionOptions): Promise<AIComple
     }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120_000);
+    const timeout = setTimeout(() => controller.abort(), 240_000);
 
     let response;
     try {
