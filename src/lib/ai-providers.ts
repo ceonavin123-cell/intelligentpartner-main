@@ -136,7 +136,7 @@ export const FREE_MODELS = [
 
 // ─── PROVIDER SELECTION ──────────────────────────────────────
 
-let defaultProvider: AIProvider = "gemini";
+let defaultProvider: AIProvider = "nvidia";
 
 export function setDefaultProvider(provider: AIProvider) {
   defaultProvider = provider;
