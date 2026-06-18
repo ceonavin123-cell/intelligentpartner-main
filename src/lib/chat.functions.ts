@@ -1058,12 +1058,15 @@ export const sendChatMessage = createServerFn({ method: "POST" })
     }
     const userMessage = injectionCheck.sanitized;
 
-    // ── RAG PIPELINE: retrieve → rerank (skip expandQuery to save AI call time) ──
+    // ── RAG PIPELINE: expand → retrieve → rerank ────────────────────────────
     const ragResult = await ragPipeline(supabase, company.id, userMessage, {
-      expandQuery: false,
+      expandQuery: true,
       rerankChunks: false,
       maxChunks: 5,
     });
+
+    // Rate-limit guard: wait 1s after RAG before main AI call
+    await new Promise((r) => setTimeout(r, 1000));
 
     // ── CONTEXT SELECTION: Optimize what goes into AI ──────────────────────
     const optimizedContext = buildOptimizedContext(
@@ -1367,8 +1370,89 @@ ${await buildMemoryPrompt(supabase, company.id)}`;
     if (!finalContent)
       finalContent = "I worked on that but didn't produce a final reply — please ask again.";
 
-    // ── SAVE & RETURN IMMEDIATELY ──────────────────────────────────
-    // Do verification, quality, and learning in background (non-blocking)
+    // ── CITATION VERIFICATION: Verify answer has proper sources ──
+    const sources = ragResult.chunks.map(
+      (c, i) => `[SOURCE ${i + 1}] "${c.document_name}": ${c.content.slice(0, 150)}`,
+    );
+    const verification = await verifyAnswer(finalContent, sources);
+
+    // ── PROMPT OPTIMIZATION: Track success/failure ──
+    trackPromptUsage(promptId, verification.verified, verification.confidence);
+
+    // ── RESPONSE QUALITY: Score answer quality ──
+    const qualityResult = analyzeQuality(finalContent, userMessage, sources, verification);
+
+    // ── CONTINUOUS LEARNING: Track this interaction ──
+    trackInteraction(
+      queryType,
+      queryComplexity,
+      qualityResult.score.overall,
+      verification.confidence,
+    );
+
+    // Add quality badge to answer
+    const qualityBadge = getQualityBadge(qualityResult.score.overall);
+    const qualityDetails = getQualityDetails(qualityResult.score);
+
+    // Add confidence badge to answer
+    const badge = getConfidenceBadge(verification.confidence);
+    if (verification.confidence < 0.5) {
+      finalContent += `\n\n---\n${badge}\n`;
+      if (verification.unsupported.length > 0) {
+        finalContent += `⚠️ Claims without source support:\n`;
+        verification.unsupported.forEach((claim) => {
+          finalContent += `- ${claim}\n`;
+        });
+      }
+    } else if (verification.citationsFound > 0) {
+      finalContent += `\n\n---\n${badge} (${verification.citationsFound} sources cited)`;
+    }
+
+    // ── QUALITY BADGE: Add quality metrics ──
+    finalContent += `\n\n---\n${qualityBadge}`;
+    finalContent += `\n📊 ${qualityDetails}`;
+    if (qualityResult.improvementSuggestions.length > 0 && qualityResult.score.overall < 0.7) {
+      finalContent += `\n💡 Suggestions: ${qualityResult.improvementSuggestions[0]}`;
+    }
+
+    // ── LEARNING STATS: Show learning progress ──
+    const learningStats = getLearningStats();
+    if (learningStats.totalInteractions > 0) {
+      const trendEmoji =
+        learningStats.qualityTrend === "improving"
+          ? "📈"
+          : learningStats.qualityTrend === "declining"
+            ? "📉"
+            : "➡️";
+      finalContent += `\n🧠 Learning: ${learningStats.totalInteractions} interactions | Avg quality: ${(learningStats.avgQuality * 100).toFixed(0)}% ${trendEmoji}`;
+    }
+
+    // ── DEBATE RESULTS: Add debate info if triggered ──
+    const debateTrace = toolTrace.find((t) => t.tool === "trigger_debate");
+    if (debateTrace?.result?.ok) {
+      const debateResult = debateTrace.result;
+      finalContent += `\n\n---\n🔍 **Multi-Agent Debate** (${debateResult.agents?.length ?? 0} agents consulted)`;
+      finalContent += `\nConfidence: ${(debateResult.confidence * 100).toFixed(0)}%`;
+    }
+
+    // ── GEOMETRIC MEMORY: Learn from this conversation (parallel) ──
+    learnFromConversation(supabase, {
+      companyId: company.id,
+      userMessage: data.message,
+      assistantReply: finalContent,
+      agent: "orchestrator",
+    })
+      .then((result) => {
+        if (result.insightsStored > 0) {
+          console.log(
+            `[memory] Stored ${result.insightsStored} insights, ${result.connectionsMade} connections`,
+          );
+        }
+      })
+      .catch((e: any) => {
+        console.error("[memory] Learning failed:", e.message);
+      });
+
     await supabase.from("chat_messages").insert({
       thread_id: data.threadId,
       role: "assistant",
@@ -1388,6 +1472,7 @@ ${await buildMemoryPrompt(supabase, company.id)}`;
       .update({ updated_at: new Date().toISOString() })
       .eq("id", data.threadId);
 
+    // ── AUDIT LOG: Track successful chat message ──
     logAuditEvent({
       action: "chat_message",
       userId: context.userId,
@@ -1396,22 +1481,6 @@ ${await buildMemoryPrompt(supabase, company.id)}`;
       details: { toolsUsed: toolTrace.length, messageLength: data.message.length },
       success: true,
     });
-
-    // Fire-and-forget: verification, quality, learning (non-blocking)
-    const replyForBg = finalContent;
-    const sourcesForBg = ragResult.chunks.map(
-      (c, i) => `[SOURCE ${i + 1}] "${c.document_name}": ${c.content.slice(0, 150)}`,
-    );
-    verifyAnswer(replyForBg, sourcesForBg).catch(() => {});
-    try { analyzeQuality(replyForBg, userMessage, sourcesForBg, { verified: true, confidence: 0.8, citationsFound: 0 }); } catch (_) {}
-    trackPromptUsage(promptId, true, 0.8);
-    trackInteraction(queryType, queryComplexity, 0.8, 0.8);
-    learnFromConversation(supabase, {
-      companyId: company.id,
-      userMessage: data.message,
-      assistantReply: replyForBg,
-      agent: "orchestrator",
-    }).catch(() => {});
 
     return { reply: finalContent, tools: toolTrace };
     } catch (err: any) {
