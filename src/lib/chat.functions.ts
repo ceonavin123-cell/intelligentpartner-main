@@ -1060,12 +1060,13 @@ export const sendChatMessage = createServerFn({ method: "POST" })
 
     // ── RAG PIPELINE: expand → retrieve → rerank ────────────────────────────
     const ragResult = await ragPipeline(supabase, company.id, userMessage, {
-      expandQuery: false,
+      expandQuery: true,
       rerankChunks: false,
       maxChunks: 5,
     });
 
-    // ── RAG done — no delay needed ──
+    // Rate-limit guard: wait 1s after RAG before main AI call
+    await new Promise((r) => setTimeout(r, 1000));
 
     // ── CONTEXT SELECTION: Optimize what goes into AI ──────────────────────
     const optimizedContext = buildOptimizedContext(
@@ -1162,11 +1163,11 @@ ${await buildMemoryPrompt(supabase, company.id)}`;
       { role: "user", content: userMessage },
     ];
 
-    // Tool loop (max 2 iterations to stay under Vercel timeout)
+    // Tool loop (max 3 iterations — balances quality vs Vercel timeout)
     let finalContent = "";
     let totalTokensUsed = 0;
     const toolTrace: any[] = [];
-    for (let iter = 0; iter < 2; iter++) {
+    for (let iter = 0; iter < 3; iter++) {
       const resp = await aiCall(msgs);
       if (resp.usage?.total_tokens) {
         totalTokensUsed += resp.usage.total_tokens;
@@ -1369,17 +1370,17 @@ ${await buildMemoryPrompt(supabase, company.id)}`;
     if (!finalContent)
       finalContent = "I worked on that but didn't produce a final reply — please ask again.";
 
-    // ── CITATION VERIFICATION: lightweight (no AI call) ──
+    // ── CITATION VERIFICATION: Verify answer has proper sources ──
     const sources = ragResult.chunks.map(
       (c, i) => `[SOURCE ${i + 1}] "${c.document_name}": ${c.content.slice(0, 150)}`,
     );
-    const verification = { verified: true, confidence: 0.8, unsupported: [], citationsFound: sources.length };
+    const verification = await verifyAnswer(finalContent, sources);
 
     // ── PROMPT OPTIMIZATION: Track success/failure ──
-    trackPromptUsage(promptId, true, 0.8);
+    trackPromptUsage(promptId, verification.verified, verification.confidence);
 
-    // ── RESPONSE QUALITY: Skip heavy analysis to save time ──
-    const qualityResult = { score: { overall: 0.8 }, improvementSuggestions: [] } as any;
+    // ── RESPONSE QUALITY: Score answer quality ──
+    const qualityResult = analyzeQuality(finalContent, userMessage, sources, verification);
 
     // ── CONTINUOUS LEARNING: Track this interaction ──
     trackInteraction(
