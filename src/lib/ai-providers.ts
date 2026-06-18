@@ -136,7 +136,7 @@ export const FREE_MODELS = [
 
 // ─── PROVIDER SELECTION ──────────────────────────────────────
 
-let defaultProvider: AIProvider = "nvidia";
+let defaultProvider: AIProvider = "minimax";
 
 export function setDefaultProvider(provider: AIProvider) {
   defaultProvider = provider;
@@ -147,19 +147,13 @@ export function getDefaultProvider(): AIProvider {
 }
 
 // ─── MAIN AI CALL FUNCTION ───────────────────────────────────
-// Includes retry with exponential backoff for 429 rate-limit errors
+// Includes retry with exponential backoff + Gemini fallback for MiniMax failures
 
-const MAX_RETRIES = 3;
-const BASE_DELAY_MS = 2000;
+const MAX_RETRIES = 2;
+const BASE_DELAY_MS = 1500;
 
-export async function aiComplete(options: AICompletionOptions): Promise<AICompletionResponse> {
-  const provider = options.provider || defaultProvider;
+async function doAiComplete(options: AICompletionOptions, provider: AIProvider): Promise<AICompletionResponse> {
   const config = PROVIDERS[provider];
-
-  if (!config) {
-    throw new Error(`Unknown provider: ${provider}`);
-  }
-
   const apiKey = config.getApiKey();
   const model = options.model || config.defaultModel;
   const headers = config.headers(apiKey);
@@ -171,7 +165,8 @@ export async function aiComplete(options: AICompletionOptions): Promise<AIComple
     max_tokens: options.max_tokens ?? 8192,
   };
 
-  if (options.tools && options.tools.length > 0) {
+  // MiniMax doesn't support tool calling — skip tools
+  if (options.tools && options.tools.length > 0 && provider !== "minimax") {
     body.tools = options.tools;
     body.tool_choice = options.tool_choice || "auto";
   }
@@ -186,7 +181,7 @@ export async function aiComplete(options: AICompletionOptions): Promise<AIComple
     }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 240_000);
+    const timeout = setTimeout(() => controller.abort(), 60_000);
 
     let response;
     try {
@@ -199,30 +194,52 @@ export async function aiComplete(options: AICompletionOptions): Promise<AIComple
     } catch (e: any) {
       clearTimeout(timeout);
       if (e.name === "AbortError") {
-        throw new Error(`AI provider ${provider} timed out after 120s`);
+        console.warn(`[ai] ${provider} timed out after 60s`);
+        lastError = new Error(`${provider} timed out`);
+        continue;
       }
-      lastError = new Error(`AI provider ${provider} network error: ${e.message}`);
-      continue; // retry on network error
+      lastError = new Error(`${provider} network error: ${e.message}`);
+      continue;
     }
     clearTimeout(timeout);
 
-    // 429 rate limit — retry with backoff
     if (response.status === 429) {
       const text = await response.text().catch(() => "");
-      console.warn(`[ai] ${provider} 429 rate limit (attempt ${attempt + 1}/${MAX_RETRIES + 1}):`, text.slice(0, 150));
-      lastError = new Error(`AI provider ${provider} rate limited (429)`);
-      continue; // retry
+      console.warn(`[ai] ${provider} 429 (attempt ${attempt + 1}):`, text.slice(0, 100));
+      lastError = new Error(`${provider} rate limited`);
+      continue;
     }
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`AI provider ${provider} error ${response.status}: ${text.slice(0, 300)}`);
+      console.warn(`[ai] ${provider} error ${response.status}:`, text.slice(0, 100));
+      lastError = new Error(`${provider} error ${response.status}`);
+      continue;
     }
 
     return response.json();
   }
 
-  throw lastError ?? new Error(`AI provider ${provider} failed after ${MAX_RETRIES + 1} attempts`);
+  throw lastError ?? new Error(`${provider} failed`);
+}
+
+export async function aiComplete(options: AICompletionOptions): Promise<AICompletionResponse> {
+  const primary = options.provider || defaultProvider;
+
+  try {
+    return await doAiComplete(options, primary);
+  } catch (primaryError: any) {
+    // If primary is minimax and fails, fallback to gemini
+    if (primary === "minimax") {
+      console.warn(`[ai] MiniMax failed (${primaryError.message}), falling back to Gemini`);
+      try {
+        return await doAiComplete(options, "gemini");
+      } catch (fallbackError: any) {
+        throw new Error(`Both MiniMax and Gemini failed. MiniMax: ${primaryError.message}. Gemini: ${fallbackError.message}`);
+      }
+    }
+    throw primaryError;
+  }
 }
 
 // ─── HELPER: Simple chat (no tools) ─────────────────────────
@@ -241,7 +258,9 @@ export async function aiChat(
     messages,
   });
 
-  return result.choices?.[0]?.message?.content ?? "";
+  const content = result.choices?.[0]?.message?.content ?? "";
+  // Strip MiniMax thinking tags
+  return content.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
 }
 
 // ─── HELPER: Chat with tool calls ────────────────────────────

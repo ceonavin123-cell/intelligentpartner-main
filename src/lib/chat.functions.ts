@@ -1120,208 +1120,78 @@ ${await buildMemoryPrompt(supabase, company.id)}`;
       { role: "user", content: userMessage },
     ];
 
-    // Tool loop (max 3 iterations — balances quality vs Vercel timeout)
-    let finalContent = "";
-    let totalTokensUsed = 0;
+    // ── STEP 1: Ask MiniMax which agents to consult ──
     const toolTrace: any[] = [];
-    for (let iter = 0; iter < 2; iter++) {
-      const resp = await aiCall(msgs);
-      if (resp.usage?.total_tokens) {
-        totalTokensUsed += resp.usage.total_tokens;
+    let totalTokensUsed = 0;
+
+    const routerPrompt = `You are a consulting router for ${company.name}.
+Based on the user's question, decide which specialist agents should respond.
+Available agents: cfo (finance), coo (operations), tax (tax & compliance), marketing (digital marketing), bizdev (business development).
+
+User question: ${userMessage}
+
+Reply with ONLY a JSON object (no other text):
+{"agents":["cfo","coo"],"reason":"brief reason"}
+If no specialist needed (simple question), reply:
+{"agents":[],"reason":"general knowledge sufficient"}`;
+
+    const routerResp = await aiChat([{ role: "user", content: routerPrompt }]);
+    totalTokensUsed += 50;
+
+    let selectedAgents: string[] = [];
+    try {
+      const routerMatch = routerResp.match(/\{[\s\S]*\}/);
+      if (routerMatch) {
+        const parsed = JSON.parse(routerMatch[0]);
+        selectedAgents = (parsed.agents ?? []).filter((a: string) =>
+          ["cfo", "coo", "tax", "marketing", "bizdev"].includes(a),
+        );
       }
-      const choice = resp.choices?.[0];
-      const m = choice?.message;
-      if (!m) break;
-      msgs.push(m);
-      const toolCalls = m.tool_calls ?? [];
-      if (toolCalls.length === 0) {
-        finalContent = m.content ?? "";
-        break;
+    } catch {
+      console.warn("[chat] Failed to parse router response, defaulting to cfo+coo");
+      selectedAgents = ["cfo", "coo"];
+    }
+    console.log(`[chat] Selected agents: ${selectedAgents.join(", ") || "none (general answer)"}`);
+
+    // ── STEP 2: Get agent opinions in parallel (MiniMax calls) ──
+    const agentContext = `Company: ${company.name}\nIndustry: ${company.industry ?? "unknown"}\nAssessment:\n${assessSummary}\nMemory:\n${memoryText}\n\nDocument context:\n${ragText}`;
+
+    const agentPromises = selectedAgents.map(async (agentKey) => {
+      const agentCfg = AGENTS[agentKey as AgentKey];
+      if (!agentCfg) return null;
+      try {
+        const answer = await aiChat([
+          { role: "system", content: `${agentCfg.prompt}\n\n${agentContext}` },
+          { role: "user", content: userMessage },
+        ]);
+        toolTrace.push({ tool: "consult_agent", args: { agent: agentKey, question: userMessage }, result: { ok: true, agent: agentKey, answer } });
+        return { agent: agentKey, name: agentCfg.name, answer };
+      } catch (e: any) {
+        toolTrace.push({ tool: "consult_agent", args: { agent: agentKey, question: userMessage }, result: { ok: false, error: e?.message } });
+        return null;
       }
-      for (const tc of toolCalls) {
-        const name = tc.function?.name;
-        let args: any = {};
-        try {
-          args = JSON.parse(tc.function?.arguments ?? "{}");
-        } catch {}
+    });
 
-        // ── TOOL ARGUMENT VALIDATION: Reject malformed tool calls ──
-        if (name === "consult_agent") {
-          const parsed = z.object({
-            agent: z.enum(["cfo", "coo", "tax", "marketing", "bizdev"]),
-            question: z.string().min(1).max(4000),
-          }).safeParse(args);
-          if (!parsed.success) {
-            toolTrace.push({ tool: name, args, result: { ok: false, error: "Invalid arguments" } });
-            msgs.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify({ ok: false, error: "Invalid arguments" }) });
-            continue;
-          }
-          args = parsed.data;
-        } else if (name === "save_memory") {
-          const parsed = z.object({
-            agent: z.enum(["cfo", "coo", "tax", "marketing", "bizdev", "orchestrator"]),
-            key: z.string().min(1).max(200),
-            value: z.string().min(1).max(2000),
-            importance: z.number().min(1).max(5).optional(),
-          }).safeParse(args);
-          if (!parsed.success) {
-            toolTrace.push({ tool: name, args, result: { ok: false, error: "Invalid arguments" } });
-            msgs.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify({ ok: false, error: "Invalid arguments" }) });
-            continue;
-          }
-          // Reject if value contains secrets/credentials
-          const valLower = parsed.data.value.toLowerCase();
-          if (valLower.match(/(api[_-]?key|password|secret|token|credential|private[_-]?key|bearer\s)/i)) {
-            toolTrace.push({ tool: name, args, result: { ok: false, error: "Cannot store secrets in memory" } });
-            msgs.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify({ ok: false, error: "Cannot store secrets in memory" }) });
-            continue;
-          }
-          // Reject if value contains prompt injection attempts
-          const injectionCheck = detectInjectionAttempts(parsed.data.value);
-          if (!injectionCheck.safe) {
-            toolTrace.push({ tool: name, args, result: { ok: false, error: "Memory content rejected — suspicious patterns detected" } });
-            msgs.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify({ ok: false, error: "Memory content rejected — suspicious patterns detected" }) });
-            continue;
-          }
-          args = parsed.data;
-        } else if (name === "update_company") {
-          const parsed = z.object({
-            industry: z.string().max(200).optional(),
-            description: z.string().max(2000).optional(),
-          }).safeParse(args);
-          if (!parsed.success) {
-            toolTrace.push({ tool: name, args, result: { ok: false, error: "Invalid arguments" } });
-            msgs.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify({ ok: false, error: "Invalid arguments" }) });
-            continue;
-          }
-          args = parsed.data;
-        } else if (name === "generate_report") {
-          const parsed = z.object({
-            type: z.string().max(100).optional(),
-            title: z.string().max(200).optional(),
-            content: z.string().max(50000).optional(),
-            agents_involved: z.array(z.string()).optional(),
-            brief: z.string().max(5000).optional(),
-            description: z.string().max(1000).optional(),
-          }).safeParse(args);
-          if (!parsed.success) {
-            toolTrace.push({ tool: name, args, result: { ok: false, error: "Invalid arguments" } });
-            msgs.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify({ ok: false, error: "Invalid arguments" }) });
-            continue;
-          }
-          args = parsed.data;
-        } else if (name === "trigger_debate") {
-          const parsed = z.object({
-            question: z.string().min(1).max(4000),
-          }).safeParse(args);
-          if (!parsed.success) {
-            toolTrace.push({ tool: name, args, result: { ok: false, error: "Invalid arguments" } });
-            msgs.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify({ ok: false, error: "Invalid arguments" }) });
-            continue;
-          }
-          args = parsed.data;
-        } else {
-          // Unknown tool — reject
-          toolTrace.push({ tool: name, args, result: { ok: false, error: `Unknown tool: ${name}` } });
-          msgs.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify({ ok: false, error: `Unknown tool: ${name}` }) });
-          continue;
-        }
+    const agentResults = (await Promise.all(agentPromises)).filter(Boolean);
 
-        let toolResult: any = { ok: false };
-        try {
-          if (name === "consult_agent") {
-            const ag = args.agent as AgentKey;
-            const agentCfg = AGENTS[ag];
-            const answer = await aiChat([
-              {
-                role: "system",
-                content: `${agentCfg.prompt}\n\nCompany: ${company.name}\nAssessment context:\n${assessSummary}\nMemory:\n${memoryText}\n\nRelevant document context:\n${ragText}`,
-              },
-              { role: "user", content: args.question },
-            ]);
-            toolResult = {
-              ok: true,
-              agent: ag,
-              answer,
-            };
-          } else if (name === "save_memory") {
-            await supabase.from("agent_memory").insert({
-              company_id: company.id,
-              agent: args.agent,
-              key: args.key,
-              value: args.value,
-              importance: args.importance ?? 1,
-            });
-            toolResult = { ok: true };
-          } else if (name === "update_company") {
-            // Only company owner can update company profile
-            if (company.owner_id !== context.userId) {
-              toolResult = { ok: false, error: "Only the company owner can update company profile" };
-            } else {
-              const upd: any = {};
-              if (args.industry) upd.industry = args.industry;
-              if (args.description) upd.description = args.description;
-              if (Object.keys(upd).length)
-                await supabase.from("companies").update(upd).eq("id", company.id);
-              toolResult = { ok: true };
-            }
-          } else if (name === "generate_report") {
-            const { data: rep } = await supabase
-              .from("reports")
-              .insert({
-                company_id: company.id,
-                thread_id: data.threadId,
-                type: args.type,
-                title: args.title,
-                content: args.content,
-                agents_involved: args.agents_involved ?? [],
-              })
-              .select()
-              .single();
+    // ── STEP 3: Synthesize final answer (MiniMax) ──
+    let finalContent = "";
+    if (agentResults.length > 0) {
+      const agentAnswersText = agentResults
+        .map((r: any) => `## ${r.name} (${r.agent})\n${r.answer}`)
+        .join("\n\n");
 
-            const slug = slugify(args.title ?? "report");
-            await supabase.from("report_templates").upsert(
-              {
-                slug,
-                label: args.title ?? "Untitled report",
-                description: args.description ?? null,
-                brief:
-                  args.brief ??
-                  `Produce a board-ready report titled "${args.title}". Match the structure, tone and visual blocks (kpi, chart, scorecard, timeline, callout) used in the original generation for this report type.`,
-                report_type: args.type ?? "work_output",
-                created_by: context.userId,
-              },
-              { onConflict: "slug" },
-            );
-
-            toolResult = { ok: true, report_id: rep?.id, template_slug: slug };
-          } else if (name === "trigger_debate") {
-            const debateResult = await agentDebate(
-              args.question,
-              AGENTS,
-              ragText,
-              memoryText,
-              assessSummary,
-            );
-            toolResult = {
-              ok: true,
-              consensus: debateResult.consensus,
-              confidence: debateResult.confidence,
-              agents: debateResult.debate.map((d) => d.agent),
-            };
-          } else {
-            toolResult = { ok: false, error: `Unknown tool ${name}` };
-          }
-        } catch (e: any) {
-          toolResult = { ok: false, error: e?.message };
-        }
-        toolTrace.push({ tool: name, args, result: toolResult });
-        msgs.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: JSON.stringify(toolResult),
-        });
-      }
+      const synthResp = await aiChat([
+        { role: "system", content: systemPrompt },
+        { role: "user", content: `User asked: ${userMessage}\n\nHere are the specialist agent responses:\n\n${agentAnswersText}\n\nSynthesize these into one clear, comprehensive response with citations. Keep sections from each agent.` },
+      ]);
+      finalContent = synthResp || agentResults.map((r: any) => `**${r.name}:** ${r.answer}`).join("\n\n");
+      totalTokensUsed += 100;
+    } else {
+      // No agents needed — direct answer
+      const directResp = await aiChat(msgs);
+      finalContent = directResp || "";
+      totalTokensUsed += 50;
     }
 
     if (!finalContent)

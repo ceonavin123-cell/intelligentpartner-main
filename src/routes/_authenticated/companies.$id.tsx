@@ -173,7 +173,7 @@ function CompanyWorkspace() {
                     </div>
                   ) : (
                     <>
-                      <p className="text-sm whitespace-pre-wrap">{a.summary}</p>
+                      <p className="text-sm whitespace-pre-wrap">{(a.summary ?? "").replace(/<think>[\s\S]*?<\/think>/g, "").trim()}</p>
                       <AgentFindings findings={a.findings} />
                     </>
                   )}
