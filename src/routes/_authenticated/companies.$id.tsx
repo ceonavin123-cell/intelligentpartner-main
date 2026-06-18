@@ -1242,8 +1242,8 @@ function ReportGenerator({ companyId }: { companyId: string }) {
   const [busy, setBusy] = useState(false);
 
   const { data: tplData } = useQuery({
-    queryKey: ["report-templates"],
-    queryFn: () => listTpls(),
+    queryKey: ["report-templates", companyId],
+    queryFn: () => listTpls({ data: { companyId } }),
     staleTime: 30_000,
   });
   const customTemplates: any[] = (tplData as any)?.templates ?? [];

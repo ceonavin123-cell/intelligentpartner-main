@@ -2,15 +2,25 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 
-export const listReportTemplates = createServerFn({ method: "GET" })
+export const listReportTemplates = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .handler(async ({ context }) => {
-    const { data, error } = await context.supabase
+  .inputValidator((d: { companyId?: string }) =>
+    z.object({ companyId: z.string().uuid().optional() }).parse(d),
+  )
+  .handler(async ({ data, context }) => {
+    let query = context.supabase
       .from("report_templates")
-      .select("id,slug,label,description,brief,report_type,created_at")
+      .select("id,slug,label,description,brief,report_type,created_at,company_id")
       .order("created_at", { ascending: false });
+
+    // Filter by company if provided — show company-specific + global (no company_id) templates
+    if (data.companyId) {
+      query = query.or(`company_id.is.null,company_id.eq.${data.companyId}`);
+    }
+
+    const { data: templates, error } = await query;
     if (error) throw new Error(error.message);
-    return { templates: data ?? [] };
+    return { templates: templates ?? [] };
   });
 
 export const deleteReportTemplate = createServerFn({ method: "POST" })

@@ -1197,6 +1197,42 @@ If no specialist needed (simple question), reply:
     if (!finalContent)
       finalContent = "I worked on that but didn't produce a final reply — please ask again.";
 
+    // ── AUTO-DETECT REPORT REQUESTS: Save to reports table ──
+    const isReportRequest = data.message.toLowerCase().match(/(make|generate|create|write|build|prepare).*(report|summary|analysis|assessment|deliverable|sow)/i);
+    if (isReportRequest && finalContent.length > 200) {
+      const reportTitle = data.message.slice(0, 100).replace(/[^\w\s]/g, "").trim() || "Generated Report";
+      const { data: rep } = await supabase
+        .from("reports")
+        .insert({
+          company_id: company.id,
+          thread_id: data.threadId,
+          type: "work_output",
+          title: reportTitle,
+          content: finalContent,
+          agents_involved: agentResults.map((r: any) => r.agent),
+        })
+        .select()
+        .single();
+
+      // Also save as reusable template
+      if (rep) {
+        const slug = reportTitle.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 60);
+        await supabase.from("report_templates").upsert(
+          {
+            slug,
+            label: reportTitle,
+            description: `Auto-generated from chat request`,
+            brief: `Report covering: ${reportTitle}`,
+            report_type: "work_output",
+            company_id: company.id,
+            created_by: context.userId,
+          } as any,
+          { onConflict: "slug" },
+        );
+        console.log(`[chat] Auto-saved report: ${reportTitle} (${rep.id})`);
+      }
+    }
+
     // ── SAVE & RETURN IMMEDIATELY ──────────────────────────────────
     await supabase.from("chat_messages").insert({
       thread_id: data.threadId,
