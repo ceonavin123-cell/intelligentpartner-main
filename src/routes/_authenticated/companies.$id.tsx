@@ -173,7 +173,7 @@ function CompanyWorkspace() {
                     </div>
                   ) : (
                     <>
-                      <p className="text-sm whitespace-pre-wrap line-clamp-6">{a.summary}</p>
+                      <p className="text-sm whitespace-pre-wrap">{a.summary}</p>
                       <AgentFindings findings={a.findings} />
                     </>
                   )}
