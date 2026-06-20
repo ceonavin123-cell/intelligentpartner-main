@@ -1,13 +1,13 @@
 // ============================================================
-// FILE: src/lib/documents.functions.ts  (REPLACE YOUR EXISTING FILE)
-// Added: embedAndStoreDocument + extractAndStoreGraph calls
-// after document upload succeeds
+// FILE: src/lib/documents.functions.ts
+// Fixes: MEDIUM-4 (ownership check), MEDIUM-5 (text size check),
+//        HIGH-1 (getDocumentChunks server function), MEDIUM-8 (generic errors)
 // ============================================================
 
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
-import { embedAndStoreDocument, extractAndStoreGraph } from "@/lib/rag.server"; // ← NEW
+import { embedAndStoreDocument, extractAndStoreGraph } from "@/lib/rag.server";
 
 const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 const MAX_BYTES = 8 * 1024 * 1024; // 8MB
@@ -63,7 +63,19 @@ export const uploadCompanyDocument = createServerFn({ method: "POST" })
         .parse(d),
   )
   .handler(async ({ data, context }) => {
-    const { supabase } = context;
+    const { supabase, userId } = context;
+
+    // Verify company ownership
+    const { data: company, error: companyErr } = await supabase
+      .from("companies")
+      .select("id")
+      .eq("id", data.companyId)
+      .eq("owner_id", userId)
+      .single();
+
+    if (companyErr || !company) {
+      throw new Error("Company not found or access denied");
+    }
 
     let content = "";
     let sizeBytes = 0;
@@ -71,6 +83,8 @@ export const uploadCompanyDocument = createServerFn({ method: "POST" })
     if (data.text) {
       content = data.text;
       sizeBytes = new TextEncoder().encode(content).length;
+      // MEDIUM-5: Text files also need size check
+      if (sizeBytes > MAX_BYTES) throw new Error("File exceeds 8MB limit");
     } else if (data.base64) {
       const buf = Buffer.from(data.base64, "base64");
       sizeBytes = buf.length;
@@ -101,7 +115,12 @@ export const uploadCompanyDocument = createServerFn({ method: "POST" })
       })
       .select("id,name,mime,size_bytes,created_at")
       .single();
-    if (error) throw new Error(error.message);
+
+    // MEDIUM-8: Generic error message
+    if (error) {
+      console.error("[server] DB error:", error.message);
+      throw new Error("Database operation failed");
+    }
 
     // ── RAG: embed chunks in background (don't await — keeps upload fast) ──
     try {
@@ -123,7 +142,18 @@ export const deleteCompanyDocument = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((d: { id: string }) => z.object({ id: z.string().uuid() }).parse(d))
   .handler(async ({ data, context }) => {
-    const { supabase } = context;
+    const { supabase, userId } = context;
+
+    // MEDIUM-4: Verify ownership before deleting
+    const { data: doc, error: docErr } = await supabase
+      .from("company_documents")
+      .select("id, company_id, companies!inner(owner_id)")
+      .eq("id", data.id)
+      .single();
+
+    if (docErr || !doc || (doc as any).companies.owner_id !== userId) {
+      throw new Error("Document not found or access denied");
+    }
 
     // Also delete chunks and graph nodes for this document
     await Promise.all([
@@ -132,6 +162,47 @@ export const deleteCompanyDocument = createServerFn({ method: "POST" })
     ]);
 
     const { error } = await supabase.from("company_documents").delete().eq("id", data.id);
-    if (error) throw new Error(error.message);
+
+    // MEDIUM-8: Generic error message
+    if (error) {
+      console.error("[server] DB error:", error.message);
+      throw new Error("Database operation failed");
+    }
+
     return { ok: true };
+  });
+
+// HIGH-1: New server function to replace raw fetch in companies.$id.tsx
+export const getDocumentChunks = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: { documentId: string }) =>
+    z.object({ documentId: z.string().uuid() }).parse(d),
+  )
+  .handler(async ({ data, context }) => {
+    const { supabase, userId } = context;
+
+    // Verify ownership through company_documents -> companies
+    const { data: doc, error: docErr } = await supabase
+      .from("company_documents")
+      .select("id, company_id, companies!inner(owner_id)")
+      .eq("id", data.documentId)
+      .single();
+
+    if (docErr || !doc || (doc as any).companies.owner_id !== userId) {
+      throw new Error("Document not found or access denied");
+    }
+
+    const { data: chunks, error } = await supabase
+      .from("document_chunks")
+      .select("chunk_index, content")
+      .eq("document_id", data.documentId)
+      .order("chunk_index", { ascending: true });
+
+    // MEDIUM-8: Generic error message
+    if (error) {
+      console.error("[server] DB error:", error.message);
+      throw new Error("Database operation failed");
+    }
+
+    return { chunks: chunks ?? [] };
   });

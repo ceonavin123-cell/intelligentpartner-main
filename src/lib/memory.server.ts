@@ -51,10 +51,26 @@ Extract key insights now.`;
       { role: "user", content: user },
     ]);
 
-    if (!content) return { insights: [] };
-    const parsed = JSON.parse(content);
-    return { insights: Array.isArray(parsed.insights) ? parsed.insights : [] };
-  } catch {
+    console.log(`[memory] extractInsights raw response (first 200):`, content.slice(0, 200));
+
+    if (!content) {
+      console.warn("[memory] extractInsights: empty response");
+      return { insights: [] };
+    }
+
+    // Try to parse JSON from response
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      console.warn("[memory] extractInsights: no JSON found in response");
+      return { insights: [] };
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    const insights = Array.isArray(parsed.insights) ? parsed.insights : [];
+    console.log(`[memory] extractInsights: extracted ${insights.length} insights`);
+    return { insights };
+  } catch (e: any) {
+    console.error("[memory] extractInsights error:", e.message);
     return { insights: [] };
   }
 }
@@ -71,6 +87,8 @@ export async function storeInsights(
   let connections = 0;
 
   for (const insight of insights) {
+    console.log(`[memory] Storing insight: "${insight.content.slice(0, 50)}..." (${insight.category})`);
+
     // Check for duplicate (same content within last 24h)
     const { data: existing } = await supabase
       .from("semantic_memories")
@@ -96,8 +114,12 @@ export async function storeInsights(
       .select("id")
       .single();
 
-    if (error || !memory) continue;
+    if (error || !memory) {
+      console.error(`[memory] Failed to store insight:`, error?.message || "no memory id");
+      continue;
+    }
     stored++;
+    console.log(`[memory] Stored insight: ${memory.id}`);
 
     // Find and create connections to related memories
     const { data: related } = await supabase
@@ -541,6 +563,7 @@ export async function learnFromConversation(
   },
 ): Promise<{ insightsStored: number; connectionsMade: number }> {
   // Step 1: Extract insights
+  console.log(`[memory] learnFromConversation called for company ${opts.companyId}`);
   const { insights } = await extractInsights({
     companyId: opts.companyId,
     userMessage: opts.userMessage,

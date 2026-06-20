@@ -7,30 +7,21 @@ export const requireSupabaseAuth = createMiddleware({ type: 'function' }).server
   async ({ next }) => {
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SUPABASE_ANON_KEY = process.env.SUPABASE_PUBLISHABLE_KEY;
-    const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-    if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !SUPABASE_SERVICE_ROLE_KEY) {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
       const missing = [
         ...(!SUPABASE_URL ? ['SUPABASE_URL'] : []),
         ...(!SUPABASE_ANON_KEY ? ['SUPABASE_PUBLISHABLE_KEY'] : []),
-        ...(!SUPABASE_SERVICE_ROLE_KEY ? ['SUPABASE_SERVICE_ROLE_KEY'] : []),
       ];
       throw new Error(`Missing env: ${missing.join(', ')}`);
     }
 
-    // Default: dev mode fallback (safe for development)
-    let supabase = createClient<Database>(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-      auth: { storage: undefined, persistSession: false, autoRefreshToken: false },
-    });
-    let userId = "00000000-0000-0000-0000-000000000000";
-    let claims = { sub: userId, email: "dev@example.com" };
-
-    // Try to extract and verify real JWT
+    // Extract JWT from Authorization header or cookie
     const request = getRequest();
     const authHeader = request?.headers?.get("authorization") ?? "";
     const cookieHeader = request?.headers?.get("cookie") ?? "";
-
     let token = "";
+
     if (authHeader.startsWith("Bearer ")) {
       token = authHeader.slice(7);
     } else {
@@ -43,31 +34,30 @@ export const requireSupabaseAuth = createMiddleware({ type: 'function' }).server
       }
     }
 
-    // If token found, verify with Supabase and create user-scoped client
-    if (token) {
-      const anonSupabase = createClient<Database>(SUPABASE_URL, SUPABASE_ANON_KEY, {
-        auth: { storage: undefined, persistSession: false, autoRefreshToken: false },
-      });
-
-      const { data: { user }, error } = await anonSupabase.auth.getUser(token);
-
-      if (!error && user) {
-        supabase = createClient<Database>(SUPABASE_URL, SUPABASE_ANON_KEY, {
-          auth: { storage: undefined, persistSession: false, autoRefreshToken: false },
-          global: { headers: { Authorization: `Bearer ${token}` } },
-        });
-        userId = user.id;
-        claims = { sub: user.id, email: user.email ?? "" };
-      } else if (process.env.NODE_ENV === "production") {
-        throw new Error("Invalid or expired session. Please log in again.");
-      } else {
-        console.warn("[auth] JWT verification failed — using dev mode fallback");
-      }
-    } else if (process.env.NODE_ENV === "production") {
+    // NO TOKEN = NO ACCESS. Always required, no exceptions, no dev bypass.
+    if (!token) {
       throw new Error("Authentication required. Please log in.");
-    } else {
-      console.warn("[auth] No JWT found — using dev mode fallback");
     }
+
+    // Verify the JWT using the anon client
+    const anonSupabase = createClient<Database>(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: { storage: undefined, persistSession: false, autoRefreshToken: false },
+    });
+    const { data: { user }, error } = await anonSupabase.auth.getUser(token);
+
+    // INVALID TOKEN = NO ACCESS. Always required, no exceptions, no dev bypass.
+    if (error || !user) {
+      throw new Error("Invalid or expired session. Please log in again.");
+    }
+
+    // Valid session — create a user-scoped client (carries the user's JWT, respects RLS)
+    const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: { storage: undefined, persistSession: false, autoRefreshToken: false },
+      global: { headers: { Authorization: `Bearer ${token}` } },
+    });
+
+    const userId = user.id;
+    const claims = { sub: user.id, email: user.email ?? "" };
 
     return next({
       context: { supabase, userId, claims },

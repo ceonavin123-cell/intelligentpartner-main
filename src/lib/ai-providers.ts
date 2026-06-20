@@ -268,18 +268,122 @@ export async function aiChat(
 export async function aiChatWithTools(
   messages: AIMessage[],
   tools: AITool[],
+  tool_choice: "auto" | "none" | "required" = "auto",
   options: {
     provider?: AIProvider;
     model?: string;
-    tool_choice?: "auto" | "none" | "required";
+    systemPrompt?: string;
   } = {},
 ): Promise<AICompletionResponse> {
+  const allMessages: AIMessage[] = [];
+  if (options.systemPrompt) {
+    allMessages.push({ role: "system", content: options.systemPrompt });
+  }
+  allMessages.push(...messages);
+
   return aiComplete({
-    ...options,
-    messages,
+    provider: options.provider,
+    model: options.model,
+    messages: allMessages,
     tools,
-    tool_choice: options.tool_choice || "auto",
+    tool_choice,
   });
+}
+
+// ─── ROUTER FUNCTION: Gemini with MiniMax fallback ──────────
+// Uses Gemini tool calling for reliable agent selection
+// Falls back to MiniMax if Gemini fails
+
+const ROUTER_TOOLS: AITool[] = [
+  {
+    type: "function",
+    function: {
+      name: "select_agents",
+      description: "Select which specialist agents should respond to the user's question",
+      parameters: {
+        type: "object",
+        properties: {
+          agents: {
+            type: "array",
+            items: { type: "string", enum: ["cfo", "coo", "tax", "marketing", "bizdev"] },
+            description: "List of agent keys to consult",
+          },
+          reason: {
+            type: "string",
+            description: "Brief reason for agent selection",
+          },
+        },
+        required: ["agents", "reason"],
+      },
+    },
+  },
+];
+
+export async function aiRouter(
+  company_name: string,
+  userMessage: string,
+): Promise<{ agents: string[]; reason: string }> {
+  const routerPrompt = `You are a consulting router for ${company_name}.
+Based on the user's question, decide which specialist agents should respond.
+Available agents: cfo (finance), coo (operations), tax (tax & compliance), marketing (digital marketing), bizdev (business development).
+If no specialist needed (simple question), return empty agents array.`;
+
+  // Try Gemini first (supports tool calling)
+  try {
+    const result = await aiChatWithTools(
+      [{ role: "user", content: userMessage }],
+      ROUTER_TOOLS,
+      "auto",
+      { provider: "gemini", systemPrompt: routerPrompt },
+    );
+
+    if (result.toolCalls && result.toolCalls.length > 0) {
+      const call = result.toolCalls[0];
+      const args = JSON.parse(call.function.arguments);
+      const validAgents = (args.agents ?? []).filter((a: string) =>
+        ["cfo", "coo", "tax", "marketing", "bizdev"].includes(a),
+      );
+      console.log(`[router] Gemini selected agents: ${validAgents.join(", ") || "none"}`);
+      return { agents: validAgents, reason: args.reason || "routing" };
+    }
+    // Gemini returned text instead of tool call — parse it
+    const text = result.text || "";
+    const match = text.match(/\{[\s\S]*\}/);
+    if (match) {
+      const parsed = JSON.parse(match[0]);
+      const validAgents = (parsed.agents ?? []).filter((a: string) =>
+        ["cfo", "coo", "tax", "marketing", "bizdev"].includes(a),
+      );
+      console.log(`[router] Gemini (text) selected agents: ${validAgents.join(", ") || "none"}`);
+      return { agents: validAgents, reason: parsed.reason || "routing" };
+    }
+    console.log("[router] Gemini returned no agents, using general answer");
+    return { agents: [], reason: "general knowledge sufficient" };
+  } catch (e: any) {
+    console.warn(`[router] Gemini failed (${e.message}), falling back to MiniMax`);
+  }
+
+  // Fallback to MiniMax (no tool calling, parse JSON from text)
+  try {
+    const routerResp = await aiChat([
+      { role: "user", content: `${routerPrompt}\n\nUser question: ${userMessage}\n\nReply with ONLY a JSON object (no other text):\n{"agents":["cfo","coo"],"reason":"brief reason"}\nIf no specialist needed, reply:\n{"agents":[],"reason":"general knowledge sufficient"}` },
+    ], { provider: "minimax" });
+
+    const match = routerResp.match(/\{[\s\S]*\}/);
+    if (match) {
+      const parsed = JSON.parse(match[0]);
+      const validAgents = (parsed.agents ?? []).filter((a: string) =>
+        ["cfo", "coo", "tax", "marketing", "bizdev"].includes(a),
+      );
+      console.log(`[router] MiniMax fallback selected agents: ${validAgents.join(", ") || "none"}`);
+      return { agents: validAgents, reason: parsed.reason || "routing" };
+    }
+    console.log("[router] MiniMax fallback returned no agents");
+    return { agents: [], reason: "general knowledge sufficient" };
+  } catch (e: any) {
+    console.warn(`[router] MiniMax fallback also failed (${e.message}), defaulting to cfo+coo`);
+    return { agents: ["cfo", "coo"], reason: "fallback default" };
+  }
 }
 
 // ─── PROVIDER HEALTH CHECK ───────────────────────────────────

@@ -246,14 +246,28 @@ ${docBlock}
 DELIVERABLE BRIEF
 ${spec.brief}
 
-Now produce the complete report as markdown. Do not wrap the whole report in code fences. Only fenced blocks are the visual blocks (chart, kpi, scorecard, timeline, callout) — each containing valid JSON.`;
+CRITICAL: You MUST include these visual blocks in your response:
+- At least 1 kpi block with 4 metrics
+- At least 2 chart blocks (different types: bar, donut, radar, funnel, area, etc.)
+- At least 1 scorecard block
+- At least 1 timeline block
+- At least 2 callout blocks
+
+Each visual block MUST be a fenced code block with the language tag (kpi, chart, scorecard, timeline, callout) containing valid JSON.
+
+Example format:
+\`\`\`kpi
+{"items":[{"label":"Metric","value":"$100K","delta":"↑ 20%","trend":"up","icon":"dollar","accent":"#10b981"}]}
+\`\`\`
+
+Now produce the complete report as markdown with ALL visual blocks included.`;
 
     const content = await aiChat(
       [
         { role: "system", content: system },
         { role: "user", content: user },
       ],
-      { provider: "nvidia", model: "minimaxai/minimax-m3" },
+      { provider: "minimax" },
     );
     if (!content) throw new Error("Empty report generation");
 

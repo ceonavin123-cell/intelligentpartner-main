@@ -12,6 +12,7 @@ import { loadMemoryContext, buildMemoryPrompt, learnFromConversation } from "@/l
 import {
   aiChat,
   aiChatWithTools,
+  aiRouter,
   type AIProvider,
   type AIMessage,
   type AITool,
@@ -737,22 +738,28 @@ function buildOptimizedContext(
   const ragText =
     selectedChunks.length > 0
       ? selectedChunks
-          .map(
-            (c, i) =>
-              `[SOURCE ${i + 1}] (relevance: ${((c.relevance_score ?? 0) * 100).toFixed(0)}%) Document: "${c.document_name}":\n${c.content}`,
-          )
-          .join("\n\n---\n\n")
+        .map(
+          (c, i) => {
+            // MEDIUM-2: Strip potential injection markers from document content
+            const safeContent = c.content
+              .replace(/\[INST\]|\[\/INST\]|<<SYS>>|<<\/SYS>>/gi, "")
+              .replace(/^(system|assistant)\s*:\s*/gim, "[doc] ")
+              .slice(0, 2000); // hard cap per chunk
+            return `[SOURCE ${i + 1}] (relevance: ${((c.relevance_score ?? 0) * 100).toFixed(0)}%) Document: "${c.document_name}":\n${safeContent}`;
+          },
+        )
+        .join("\n\n---\n\n")
       : "(no relevant document chunks found)";
 
   // Graph context (limit to top 15)
   const graphText =
     ragResult.graphNodes.length > 0
       ? ragResult.graphNodes
-          .slice(0, 15)
-          .map(
-            (n: any) => `• ${n.entity} → [${n.relation}] → ${n.target}  (source: ${n.source_doc})`,
-          )
-          .join("\n")
+        .slice(0, 15)
+        .map(
+          (n: any) => `• ${n.entity} → [${n.relation}] → ${n.target}  (source: ${n.source_doc})`,
+        )
+        .join("\n")
       : "(no related graph nodes found)";
 
   // Memory context (limit to top 10)
@@ -960,12 +967,31 @@ export const createThread = createServerFn({ method: "POST" })
     z.object({ companyId: z.string().uuid(), title: z.string().max(200).optional() }).parse(d),
   )
   .handler(async ({ data, context }) => {
-    const { data: t, error } = await context.supabase
+    const { supabase, userId } = context;
+
+    // Verify company ownership
+    const { data: company, error: companyErr } = await supabase
+      .from("companies")
+      .select("id")
+      .eq("id", data.companyId)
+      .eq("owner_id", userId)
+      .single();
+
+    if (companyErr || !company) {
+      throw new Error("Company not found or access denied");
+    }
+
+    const { data: t, error } = await supabase
       .from("chat_threads")
       .insert({ company_id: data.companyId, title: data.title ?? "New conversation" })
       .select()
       .single();
-    if (error) throw new Error(error.message);
+
+    if (error) {
+      console.error("[server] DB error:", error.message);
+      throw new Error("Database operation failed");
+    }
+
     return { thread: t };
   });
 
@@ -973,12 +999,30 @@ export const listThreadMessages = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((d: { threadId: string }) => z.object({ threadId: z.string().uuid() }).parse(d))
   .handler(async ({ data, context }) => {
-    const { data: msgs, error } = await context.supabase
+    const { supabase, userId } = context;
+
+    // Verify thread ownership via companies join
+    const { data: thread, error: threadErr } = await supabase
+      .from("chat_threads")
+      .select("id, companies!inner(owner_id)")
+      .eq("id", data.threadId)
+      .single();
+
+    if (threadErr || !thread || (thread as any).companies.owner_id !== userId) {
+      throw new Error("Thread not found or access denied");
+    }
+
+    const { data: msgs, error } = await supabase
       .from("chat_messages")
       .select("*")
       .eq("thread_id", data.threadId)
       .order("created_at", { ascending: true });
-    if (error) throw new Error(error.message);
+
+    if (error) {
+      console.error("[server] DB error:", error.message);
+      throw new Error("Database operation failed");
+    }
+
     return { messages: msgs ?? [] };
   });
 
@@ -991,98 +1035,103 @@ export const sendChatMessage = createServerFn({ method: "POST" })
     const { supabase } = context;
 
     try {
-    // ── RATE LIMITING: Check per-user request limit ──
-    const rateLimit = checkRateLimit(`chat:${context.userId}`, RATE_LIMITS.chat);
-    if (!rateLimit.allowed) {
-      throw new Error(`Rate limit exceeded. Try again in ${Math.ceil(rateLimit.resetIn / 1000)}s.`);
-    }
+      // ── RATE LIMITING: Check per-user request limit ──
+      const rateLimit = checkRateLimit(`chat:${context.userId}`, RATE_LIMITS.chat);
+      if (!rateLimit.allowed) {
+        throw new Error(`Rate limit exceeded. Try again in ${Math.ceil(rateLimit.resetIn / 1000)}s.`);
+      }
 
-    // Resolve thread + company + memory + history
-    const { data: thread, error: tErr } = await supabase
-      .from("chat_threads")
-      .select("*, companies(*)")
-      .eq("id", data.threadId)
-      .single();
-    if (tErr || !thread) throw new Error(tErr?.message ?? "Thread not found");
-    const company: any = (thread as any).companies;
+      // Resolve thread + company + memory + history
+      const { data: thread, error: tErr } = await supabase
+        .from("chat_threads")
+        .select("*, companies!inner(*, owner_id)")
+        .eq("id", data.threadId)
+        .single();
+      if (tErr || !thread) throw new Error("Thread not found or access denied");
+      if ((thread as any).companies.owner_id !== context.userId) {
+        throw new Error("Access denied to this thread");
+      }
+      const company: any = (thread as any).companies;
 
-    const [{ data: history }, { data: memory }, { data: assessments }] = await Promise.all([
-      supabase
-        .from("chat_messages")
-        .select("*")
-        .eq("thread_id", data.threadId)
-        .order("created_at", { ascending: true })
-        .limit(20),
-      supabase.from("agent_memory").select("*").eq("company_id", company.id),
-      supabase
-        .from("agent_assessments")
-        .select("agent,summary,findings")
-        .eq("company_id", company.id),
-    ]);
+      const [{ data: history }, { data: memory }, { data: assessments }] = await Promise.all([
+        supabase
+          .from("chat_messages")
+          .select("*")
+          .eq("thread_id", data.threadId)
+          .order("created_at", { ascending: true })
+          .limit(20),
+        supabase.from("agent_memory").select("*").eq("company_id", company.id),
+        supabase
+          .from("agent_assessments")
+          .select("agent,summary,findings")
+          .eq("company_id", company.id),
+      ]);
 
-    // Check token usage limit
-    const tokenLimit = company.token_limit ?? 100000;
-    const tokenUsed = company.token_used ?? 0;
-    if (tokenLimit > 0 && tokenUsed >= tokenLimit) {
+      // Atomic token limit check (p_amount=0 = check only, no deduction)
+      const { data: preCheck } = await supabase.rpc("consume_tokens", {
+        p_company_id: company.id,
+        p_amount: 0,
+      });
+      if (!preCheck?.allowed) {
+        await supabase
+          .from("chat_messages")
+          .insert({ thread_id: data.threadId, role: "user", content: data.message });
+
+        const limitMsg = `⚠️ **Token usage limit reached** for this company (${preCheck?.used?.toLocaleString() ?? '?'} / ${preCheck?.limit?.toLocaleString() ?? '?'} tokens used).\n\nPlease click the **Token Limit** button near the input to increase the limit or reset the counter.`;
+
+        await supabase.from("chat_messages").insert({
+          thread_id: data.threadId,
+          role: "assistant",
+          content: limitMsg,
+        });
+        return { reply: limitMsg, tools: [] };
+      }
+
+      // Save user message
       await supabase
         .from("chat_messages")
         .insert({ thread_id: data.threadId, role: "user", content: data.message });
 
-      const limitMsg = `⚠️ **Token usage limit reached** for this company (${tokenUsed.toLocaleString()} / ${tokenLimit.toLocaleString()} tokens used).\n\nPlease click the **Token Limit** button near the input to increase the limit or reset the counter.`;
+      // ── INPUT SANITIZATION: Detect prompt injection ──
+      const injectionCheck = detectInjectionAttempts(data.message);
+      if (!injectionCheck.safe) {
+        console.warn(`[security] Injection patterns detected in message from user ${context.userId}`);
+        logAuditEvent({
+          action: "injection_detected",
+          userId: context.userId,
+          companyId: company.id,
+          details: { patterns: injectionCheck.patterns, messagePreview: data.message.slice(0, 100) },
+          success: false,
+        });
+        // Continue but with sanitized input — don't block legitimate questions
+      }
+      const userMessage = injectionCheck.sanitized;
 
-      await supabase.from("chat_messages").insert({
-        thread_id: data.threadId,
-        role: "assistant",
-        content: limitMsg,
+      // ── RAG PIPELINE: retrieve → rerank (skip expandQuery to save AI call time) ──
+      const ragResult = await ragPipeline(supabase, company.id, userMessage, {
+        expandQuery: false,
+        rerankChunks: false,
+        maxChunks: 5,
       });
-      return { reply: limitMsg, tools: [] };
-    }
 
-    // Save user message
-    await supabase
-      .from("chat_messages")
-      .insert({ thread_id: data.threadId, role: "user", content: data.message });
+      // ── CONTEXT SELECTION: Optimize what goes into AI ──────────────────────
+      const optimizedContext = buildOptimizedContext(
+        ragResult,
+        memory ?? [],
+        assessments ?? [],
+        6000,
+      );
+      const { ragText, graphText, memoryText, assessSummary } = optimizedContext;
 
-    // ── INPUT SANITIZATION: Detect prompt injection ──
-    const injectionCheck = detectInjectionAttempts(data.message);
-    if (!injectionCheck.safe) {
-      console.warn(`[security] Injection patterns detected in message from user ${context.userId}`);
-      logAuditEvent({
-        action: "injection_detected",
-        userId: context.userId,
-        companyId: company.id,
-        details: { patterns: injectionCheck.patterns, messagePreview: data.message.slice(0, 100) },
-        success: false,
-      });
-      // Continue but with sanitized input — don't block legitimate questions
-    }
-    const userMessage = injectionCheck.sanitized;
+      // ── PROMPT OPTIMIZATION: Detect query type and complexity ──
+      const queryType = detectQueryType(userMessage);
+      const queryComplexity = assessQueryComplexity(userMessage);
+      const optimizedPrompt = getOptimizedPrompt(queryType, queryComplexity);
 
-    // ── RAG PIPELINE: retrieve → rerank (skip expandQuery to save AI call time) ──
-    const ragResult = await ragPipeline(supabase, company.id, userMessage, {
-      expandQuery: false,
-      rerankChunks: false,
-      maxChunks: 5,
-    });
+      // Track this query for optimization
+      const promptId = `${queryType}_${queryComplexity}`;
 
-    // ── CONTEXT SELECTION: Optimize what goes into AI ──────────────────────
-    const optimizedContext = buildOptimizedContext(
-      ragResult,
-      memory ?? [],
-      assessments ?? [],
-      6000,
-    );
-    const { ragText, graphText, memoryText, assessSummary } = optimizedContext;
-
-    // ── PROMPT OPTIMIZATION: Detect query type and complexity ──
-    const queryType = detectQueryType(userMessage);
-    const queryComplexity = assessQueryComplexity(userMessage);
-    const optimizedPrompt = getOptimizedPrompt(queryType, queryComplexity);
-
-    // Track this query for optimization
-    const promptId = `${queryType}_${queryComplexity}`;
-
-    const systemPrompt = `You are the lead consulting orchestrator for ${company.name}${company.website ? ` (${company.website})` : ""}.
+      const systemPrompt = `You are the lead consulting orchestrator for ${company.name}${company.website ? ` (${company.website})` : ""}.
 Industry: ${company.industry ?? "unknown"}.
 You manage FIVE specialist agents: CFO (finance), COO (operations), Tax (tax & compliance), Marketing (digital marketing), BizDev (business development).
 
@@ -1114,231 +1163,219 @@ ${graphText}
 ━━━ GEOMETRIC MEMORY ━━━
 ${await buildMemoryPrompt(supabase, company.id)}`;
 
-    const msgs: any[] = [
-      { role: "system", content: systemPrompt },
-      ...(history ?? []).map((m: any) => ({ role: m.role, content: m.content })),
-      { role: "user", content: userMessage },
-    ];
-
-    // ── STEP 1: Ask MiniMax which agents to consult ──
-    const toolTrace: any[] = [];
-    let totalTokensUsed = 0;
-
-    const routerPrompt = `You are a consulting router for ${company.name}.
-Based on the user's question, decide which specialist agents should respond.
-Available agents: cfo (finance), coo (operations), tax (tax & compliance), marketing (digital marketing), bizdev (business development).
-
-User question: ${userMessage}
-
-Reply with ONLY a JSON object (no other text):
-{"agents":["cfo","coo"],"reason":"brief reason"}
-If no specialist needed (simple question), reply:
-{"agents":[],"reason":"general knowledge sufficient"}`;
-
-    const routerResp = await aiChat([{ role: "user", content: routerPrompt }]);
-    totalTokensUsed += 50;
-
-    let selectedAgents: string[] = [];
-    try {
-      const routerMatch = routerResp.match(/\{[\s\S]*\}/);
-      if (routerMatch) {
-        const parsed = JSON.parse(routerMatch[0]);
-        selectedAgents = (parsed.agents ?? []).filter((a: string) =>
-          ["cfo", "coo", "tax", "marketing", "bizdev"].includes(a),
-        );
-      }
-    } catch {
-      console.warn("[chat] Failed to parse router response, defaulting to cfo+coo");
-      selectedAgents = ["cfo", "coo"];
-    }
-    console.log(`[chat] Selected agents: ${selectedAgents.join(", ") || "none (general answer)"}`);
-
-    // ── STEP 2: Get agent opinions in parallel (MiniMax calls) ──
-    const agentContext = `Company: ${company.name}\nIndustry: ${company.industry ?? "unknown"}\nAssessment:\n${assessSummary}\nMemory:\n${memoryText}\n\nDocument context:\n${ragText}`;
-
-    const agentPromises = selectedAgents.map(async (agentKey) => {
-      const agentCfg = AGENTS[agentKey as AgentKey];
-      if (!agentCfg) return null;
-      try {
-        const answer = await aiChat([
-          { role: "system", content: `${agentCfg.prompt}\n\n${agentContext}` },
-          { role: "user", content: userMessage },
-        ]);
-        toolTrace.push({ tool: "consult_agent", args: { agent: agentKey, question: userMessage }, result: { ok: true, agent: agentKey, answer } });
-        return { agent: agentKey, name: agentCfg.name, answer };
-      } catch (e: any) {
-        toolTrace.push({ tool: "consult_agent", args: { agent: agentKey, question: userMessage }, result: { ok: false, error: e?.message } });
-        return null;
-      }
-    });
-
-    const agentResults = (await Promise.all(agentPromises)).filter(Boolean);
-
-    // ── STEP 3: Synthesize final answer (MiniMax) ──
-    let finalContent = "";
-    if (agentResults.length > 0) {
-      const agentAnswersText = agentResults
-        .map((r: any) => `## ${r.name} (${r.agent})\n${r.answer}`)
-        .join("\n\n");
-
-      const synthResp = await aiChat([
+      const msgs: any[] = [
         { role: "system", content: systemPrompt },
-        { role: "user", content: `User asked: ${userMessage}\n\nHere are the specialist agent responses:\n\n${agentAnswersText}\n\nSynthesize these into one clear, comprehensive response with citations. Keep sections from each agent.` },
-      ]);
-      finalContent = synthResp || agentResults.map((r: any) => `**${r.name}:** ${r.answer}`).join("\n\n");
-      totalTokensUsed += 100;
-    } else {
-      // No agents needed — direct answer
-      const directResp = await aiChat(msgs);
-      finalContent = directResp || "";
+        ...(history ?? []).map((m: any) => ({ role: m.role, content: m.content })),
+        { role: "user", content: userMessage },
+      ];
+
+      // ── STEP 1: Ask router which agents to consult (Gemini → MiniMax fallback) ──
+      const toolTrace: any[] = [];
+      let totalTokensUsed = 0;
+
+      const { agents: selectedAgents, reason: routerReason } = await aiRouter(company.name, userMessage);
       totalTokensUsed += 50;
-    }
+      console.log(`[chat] Router reason: ${routerReason}`);
 
-    if (!finalContent)
-      finalContent = "I worked on that but didn't produce a final reply — please ask again.";
+      // ── STEP 2: Get agent opinions in parallel (MiniMax calls) ──
+      const agentContext = `Company: ${company.name}\nIndustry: ${company.industry ?? "unknown"}\nAssessment:\n${assessSummary}\nMemory:\n${memoryText}\n\nDocument context:\n${ragText}`;
 
-    // ── AUTO-DETECT REPORT REQUESTS: Save to reports table ──
-    const isReportRequest = data.message.toLowerCase().match(/(make|generate|create|write|build|prepare).*(report|summary|analysis|assessment|deliverable|sow)/i);
-    if (isReportRequest && finalContent.length > 200) {
-      const reportTitle = data.message.slice(0, 100).replace(/[^\w\s]/g, "").trim() || "Generated Report";
-      const { data: rep } = await supabase
-        .from("reports")
-        .insert({
-          company_id: company.id,
-          thread_id: data.threadId,
-          type: "work_output",
-          title: reportTitle,
-          content: finalContent,
-          agents_involved: agentResults.map((r: any) => r.agent),
-        })
-        .select()
-        .single();
-
-      // Also save as reusable template
-      if (rep) {
-        const slug = reportTitle.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 60);
-        await supabase.from("report_templates").upsert(
-          {
-            slug,
-            label: reportTitle,
-            description: `Auto-generated from chat request`,
-            brief: `Report covering: ${reportTitle}`,
-            report_type: "work_output",
-            company_id: company.id,
-            created_by: context.userId,
-          } as any,
-          { onConflict: "slug" },
-        );
-        console.log(`[chat] Auto-saved report: ${reportTitle} (${rep.id})`);
-      }
-    }
-
-    // ── SAVE & RETURN IMMEDIATELY ──────────────────────────────────
-    await supabase.from("chat_messages").insert({
-      thread_id: data.threadId,
-      role: "assistant",
-      content: finalContent,
-      metadata: { tools: toolTrace },
-    });
-
-    if (totalTokensUsed > 0) {
-      await supabase
-        .from("companies")
-        .update({ token_used: (company.token_used || 0) + totalTokensUsed })
-        .eq("id", company.id);
-    }
-
-    await supabase
-      .from("chat_threads")
-      .update({ updated_at: new Date().toISOString() })
-      .eq("id", data.threadId);
-
-    logAuditEvent({
-      action: "chat_message",
-      userId: context.userId,
-      companyId: company.id,
-      target: `thread:${data.threadId}`,
-      details: { toolsUsed: toolTrace.length, messageLength: data.message.length },
-      success: true,
-    });
-
-    // Fire-and-forget: verification, quality, learning (non-blocking)
-    const sources = ragResult.chunks.map(
-      (c, i) => `[SOURCE ${i + 1}] "${c.document_name}": ${c.content.slice(0, 150)}`,
-    );
-    const verification = await verifyAnswer(finalContent, sources);
-    const qualityResult = analyzeQuality(finalContent, userMessage, sources, verification);
-    trackPromptUsage(promptId, verification.verified, verification.confidence);
-    trackInteraction(queryType, queryComplexity, qualityResult.score.overall, verification.confidence);
-
-    const qualityBadge = getQualityBadge(qualityResult.score.overall);
-    const qualityDetails = getQualityDetails(qualityResult.score);
-    const badge = getConfidenceBadge(verification.confidence);
-
-    let finalWithBadges = finalContent;
-    if (verification.confidence < 0.5) {
-      finalWithBadges += `\n\n---\n${badge}\n`;
-      if (verification.unsupported.length > 0) {
-        finalWithBadges += `⚠️ Claims without source support:\n`;
-        verification.unsupported.forEach((claim) => {
-          finalWithBadges += `- ${claim}\n`;
-        });
-      }
-    } else if (verification.citationsFound > 0) {
-      finalWithBadges += `\n\n---\n${badge} (${verification.citationsFound} sources cited)`;
-    }
-
-    finalWithBadges += `\n\n---\n${qualityBadge}`;
-    finalWithBadges += `\n📊 ${qualityDetails}`;
-    if (qualityResult.improvementSuggestions.length > 0 && qualityResult.score.overall < 0.7) {
-      finalWithBadges += `\n💡 Suggestions: ${qualityResult.improvementSuggestions[0]}`;
-    }
-
-    const learningStats = getLearningStats();
-    if (learningStats.totalInteractions > 0) {
-      const trendEmoji =
-        learningStats.qualityTrend === "improving"
-          ? "📈"
-          : learningStats.qualityTrend === "declining"
-            ? "📉"
-            : "➡️";
-      finalWithBadges += `\n🧠 Learning: ${learningStats.totalInteractions} interactions | Avg quality: ${(learningStats.avgQuality * 100).toFixed(0)}% ${trendEmoji}`;
-    }
-
-    // Update saved message with badges
-    await supabase
-      .from("chat_messages")
-      .update({ content: finalWithBadges })
-      .eq("thread_id", data.threadId)
-      .eq("role", "assistant")
-      .eq("content", finalContent);
-
-    // ── DEBATE RESULTS: Add debate info if triggered ──
-    const debateTrace = toolTrace.find((t) => t.tool === "trigger_debate");
-    if (debateTrace?.result?.ok) {
-      const debateResult = debateTrace.result;
-      finalWithBadges += `\n\n---\n🔍 **Multi-Agent Debate** (${debateResult.agents?.length ?? 0} agents consulted)`;
-      finalWithBadges += `\nConfidence: ${(debateResult.confidence * 100).toFixed(0)}%`;
-    }
-
-    learnFromConversation(supabase, {
-      companyId: company.id,
-      userMessage: data.message,
-      assistantReply: finalWithBadges,
-      agent: "orchestrator",
-    })
-      .then((result) => {
-        if (result.insightsStored > 0) {
-          console.log(
-            `[memory] Stored ${result.insightsStored} insights, ${result.connectionsMade} connections`,
-          );
+      const agentPromises = selectedAgents.map(async (agentKey) => {
+        const agentCfg = AGENTS[agentKey as AgentKey];
+        if (!agentCfg) return null;
+        try {
+          const answer = await aiChat([
+            { role: "system", content: `${agentCfg.prompt}\n\n${agentContext}` },
+            { role: "user", content: userMessage },
+          ]);
+          toolTrace.push({ tool: "consult_agent", args: { agent: agentKey, question: userMessage }, result: { ok: true, agent: agentKey, answer } });
+          return { agent: agentKey, name: agentCfg.name, answer };
+        } catch (e: any) {
+          toolTrace.push({ tool: "consult_agent", args: { agent: agentKey, question: userMessage }, result: { ok: false, error: e?.message } });
+          return null;
         }
-      })
-      .catch((e: any) => {
-        console.error("[memory] Learning failed:", e.message);
       });
 
-    return { reply: finalWithBadges, tools: toolTrace };
+      const agentResults = (await Promise.all(agentPromises)).filter(Boolean);
+
+      // ── STEP 3: Synthesize final answer (MiniMax) ──
+      let finalContent = "";
+      if (agentResults.length > 0) {
+        const agentAnswersText = agentResults
+          .map((r: any) => `## ${r.name} (${r.agent})\n${r.answer}`)
+          .join("\n\n");
+
+        const synthResp = await aiChat([
+          { role: "system", content: systemPrompt },
+          { role: "user", content: `User asked: ${userMessage}\n\nHere are the specialist agent responses:\n\n${agentAnswersText}\n\nSynthesize these into one clear, comprehensive response with citations. Keep sections from each agent.` },
+        ]);
+        finalContent = synthResp || agentResults.map((r: any) => `**${r.name}:** ${r.answer}`).join("\n\n");
+        totalTokensUsed += 100;
+      } else {
+        // No agents needed — direct answer
+        const directResp = await aiChat(msgs);
+        finalContent = directResp || "";
+        totalTokensUsed += 50;
+      }
+
+      if (!finalContent)
+        finalContent = "I worked on that but didn't produce a final reply — please ask again.";
+
+      // ── AUTO-DETECT REPORT REQUESTS: Save to reports table ──
+      const msgLower = data.message.toLowerCase();
+      const isReportRequest = msgLower.match(/(make|generate|create|write|build|prepare|format|convert|turn|save|export|give|show|put|display|present|organize|structure).*(report|summary|analysis|assessment|deliverable|sow|document|format|formate)/i)
+        || msgLower.match(/(report|summary|analysis).*(format|formate|form|style|layout)/i)
+        || msgLower.match(/in\s+(report|structured|document)\s+format/i)
+        || msgLower.match(/(report|formate|format)\s*(me|it|this|that|please|now|asap|quick|fast)/i)
+        || msgLower.match(/(nicely|clean|neat|proper|good|nice|better|best).*(report|formate|format|structured)/i)
+        || msgLower.match(/(report|formate|format).*(nicely|clean|neat|proper|good|nice|better|best)/i)
+        || msgLower.match(/(make|give|show).*(nicely|clean|neat|proper|good|nice).*(report|format|formate)/i)
+        || msgLower.match(/(save|export|download).*(as|to|in).*(report|pdf|document|file|template)/i);
+      let reportSaved = false;
+      if (isReportRequest && finalContent.length > 50) {
+        const reportTitle = data.message.slice(0, 100).replace(/[^\w\s]/g, "").trim() || "Generated Report";
+        const { data: rep } = await supabase
+          .from("reports")
+          .insert({
+            company_id: company.id,
+            thread_id: data.threadId,
+            type: "work_output",
+            title: reportTitle,
+            content: finalContent,
+            agents_involved: agentResults.map((r: any) => r.agent),
+          })
+          .select()
+          .single();
+
+        // Also save as reusable template
+        if (rep) {
+          const slug = reportTitle.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 60);
+          await supabase.from("report_templates").upsert(
+            {
+              slug,
+              label: reportTitle,
+              description: `Auto-generated from chat request`,
+              brief: `Report covering: ${reportTitle}`,
+              report_type: "work_output",
+              company_id: company.id,
+              created_by: context.userId,
+            } as any,
+            { onConflict: "slug" },
+          );
+          console.log(`[chat] Auto-saved report: ${reportTitle} (${rep.id})`);
+          reportSaved = true;
+        }
+      }
+
+      // ── SAVE & RETURN IMMEDIATELY ──────────────────────────────────
+      await supabase.from("chat_messages").insert({
+        thread_id: data.threadId,
+        role: "assistant",
+        content: finalContent,
+        metadata: { tools: toolTrace },
+      });
+
+      if (totalTokensUsed > 0) {
+        const { data: tokenResult } = await supabase.rpc("consume_tokens", {
+          p_company_id: company.id,
+          p_amount: totalTokensUsed,
+        });
+        if (!tokenResult?.allowed) {
+          console.error("[chat] Token limit exceeded after AI call");
+        }
+      }
+
+      await supabase
+        .from("chat_threads")
+        .update({ updated_at: new Date().toISOString() })
+        .eq("id", data.threadId);
+
+      logAuditEvent({
+        action: "chat_message",
+        userId: context.userId,
+        companyId: company.id,
+        target: `thread:${data.threadId}`,
+        details: { toolsUsed: toolTrace.length, messageLength: data.message.length },
+        success: true,
+      });
+
+      // Fire-and-forget: verification, quality, learning (non-blocking)
+      const sources = ragResult.chunks.map(
+        (c, i) => `[SOURCE ${i + 1}] "${c.document_name}": ${c.content.slice(0, 150)}`,
+      );
+      const verification = await verifyAnswer(finalContent, sources);
+      const qualityResult = analyzeQuality(finalContent, userMessage, sources, verification);
+      trackPromptUsage(promptId, verification.verified, verification.confidence);
+      trackInteraction(queryType, queryComplexity, qualityResult.score.overall, verification.confidence);
+
+      const qualityBadge = getQualityBadge(qualityResult.score.overall);
+      const qualityDetails = getQualityDetails(qualityResult.score);
+      const badge = getConfidenceBadge(verification.confidence);
+
+      let finalWithBadges = finalContent;
+      if (verification.confidence < 0.5) {
+        finalWithBadges += `\n\n---\n${badge}\n`;
+        if (verification.unsupported.length > 0) {
+          finalWithBadges += `⚠️ Claims without source support:\n`;
+          verification.unsupported.forEach((claim) => {
+            finalWithBadges += `- ${claim}\n`;
+          });
+        }
+      } else if (verification.citationsFound > 0) {
+        finalWithBadges += `\n\n---\n${badge} (${verification.citationsFound} sources cited)`;
+      }
+
+      finalWithBadges += `\n\n---\n${qualityBadge}`;
+      finalWithBadges += `\n📊 ${qualityDetails}`;
+      if (qualityResult.improvementSuggestions.length > 0 && qualityResult.score.overall < 0.7) {
+        finalWithBadges += `\n💡 Suggestions: ${qualityResult.improvementSuggestions[0]}`;
+      }
+
+      const learningStats = getLearningStats();
+      if (learningStats.totalInteractions > 0) {
+        const trendEmoji =
+          learningStats.qualityTrend === "improving"
+            ? "📈"
+            : learningStats.qualityTrend === "declining"
+              ? "📉"
+              : "➡️";
+        finalWithBadges += `\n🧠 Learning: ${learningStats.totalInteractions} interactions | Avg quality: ${(learningStats.avgQuality * 100).toFixed(0)}% ${trendEmoji}`;
+      }
+
+      // Update saved message with badges
+      await supabase
+        .from("chat_messages")
+        .update({ content: finalWithBadges })
+        .eq("thread_id", data.threadId)
+        .eq("role", "assistant")
+        .eq("content", finalContent);
+
+      // ── DEBATE RESULTS: Add debate info if triggered ──
+      const debateTrace = toolTrace.find((t) => t.tool === "trigger_debate");
+      if (debateTrace?.result?.ok) {
+        const debateResult = debateTrace.result;
+        finalWithBadges += `\n\n---\n🔍 **Multi-Agent Debate** (${debateResult.agents?.length ?? 0} agents consulted)`;
+        finalWithBadges += `\nConfidence: ${(debateResult.confidence * 100).toFixed(0)}%`;
+      }
+
+      learnFromConversation(supabase, {
+        companyId: company.id,
+        userMessage: data.message,
+        assistantReply: finalWithBadges,
+        agent: "orchestrator",
+      })
+        .then((result) => {
+          if (result.insightsStored > 0) {
+            console.log(
+              `[memory] Stored ${result.insightsStored} insights, ${result.connectionsMade} connections`,
+            );
+          }
+        })
+        .catch((e: any) => {
+          console.error("[memory] Learning failed:", e.message);
+        });
+
+      return { reply: finalWithBadges, tools: toolTrace, reportSaved };
     } catch (err: any) {
       console.error("[chat] sendChatMessage error:", err?.message, err?.stack?.slice(0, 300));
       throw err;

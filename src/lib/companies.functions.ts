@@ -30,7 +30,10 @@ export const createCompany = createServerFn({ method: "POST" })
       })
       .select()
       .single();
-    if (error) throw new Error(error.message);
+    if (error) {
+      console.error("[server] DB error:", error.message);
+      throw new Error("Database operation failed");
+    }
     return { company };
   });
 
@@ -42,7 +45,10 @@ export const listCompanies = createServerFn({ method: "GET" })
       .select("*")
       .eq("owner_id", context.userId)
       .order("created_at", { ascending: false });
-    if (error) throw new Error(error.message);
+    if (error) {
+      console.error("[server] DB error:", error.message);
+      throw new Error("Database operation failed");
+    }
     return { companies: data ?? [] };
   });
 
@@ -50,16 +56,20 @@ export const getCompanyDetails = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((d: { id: string }) => z.object({ id: z.string().uuid() }).parse(d))
   .handler(async ({ data, context }) => {
-    const { supabase } = context;
+    const { supabase, userId } = context;
     const [c, a, s, r, t, d] = await Promise.all([
-      supabase.from("companies").select("*").eq("id", data.id).single(),
+      supabase.from("companies").select("*").eq("id", data.id).eq("owner_id", userId).single(),
       supabase.from("agent_assessments").select("*").eq("company_id", data.id),
       supabase.from("research_sources").select("*").eq("company_id", data.id),
       supabase.from("reports").select("*").eq("company_id", data.id).order("created_at", { ascending: false }),
       supabase.from("chat_threads").select("*").eq("company_id", data.id).order("created_at", { ascending: false }),
       supabase.from("company_documents").select("id,name,mime,size_bytes,created_at").eq("company_id", data.id).order("created_at", { ascending: false }),
     ]);
-    if (c.error) throw new Error(c.error.message);
+
+    if (c.error || !c.data) {
+      throw new Error("Company not found or access denied");
+    }
+
     return {
       company: c.data,
       assessments: a.data ?? [],
@@ -74,13 +84,17 @@ export const runCompanyResearch = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((d: { companyId: string }) => z.object({ companyId: z.string().uuid() }).parse(d))
   .handler(async ({ data, context }) => {
-    const { supabase } = context;
+    const { supabase, userId } = context;
+
+    // Verify ownership
     const { data: company, error: cErr } = await supabase
       .from("companies")
       .select("*")
       .eq("id", data.companyId)
+      .eq("owner_id", userId)
       .single();
-    if (cErr || !company) throw new Error(cErr?.message ?? "Company not found");
+
+    if (cErr || !company) throw new Error("Company not found or access denied");
 
     await supabase.from("companies").update({ status: "researching" }).eq("id", company.id);
 
@@ -115,33 +129,64 @@ export const runCompanyResearch = createServerFn({ method: "POST" })
     }
     if (sourceRows.length) await supabase.from("research_sources").insert(sourceRows);
 
-    // Run agents in parallel
-    const results = await Promise.all(
-      AGENTS.map(async (agent) => {
-        try {
-          const r = await runAgentAssessment({
+    // Run agents in 2 batches for speed + avoid MiniMax rate limiting
+    const runAgent = async (agent: AgentKey) => {
+      try {
+        const r = await Promise.race([
+          runAgentAssessment({
             agent,
             companyName: company.name,
             website: company.website,
             research,
-          });
-          await supabase
-            .from("agent_assessments")
-            .update({
-              status: "complete",
-              summary: r.summary,
-              findings: r.findings,
-              risk_score: r.risk_score,
-            })
-            .eq("company_id", company.id)
-            .eq("agent", agent);
-          return { agent, ok: true };
-        } catch (e: any) {
-          console.error("[agent]", agent, e);
-          return { agent, ok: false, error: e?.message };
-        }
-      }),
-    );
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`${agent} timed out after 120s`)), 120_000)
+          ),
+        ]);
+        await supabase
+          .from("agent_assessments")
+          .update({
+            status: "complete",
+            summary: r.summary,
+            findings: r.findings,
+            risk_score: r.risk_score,
+          })
+          .eq("company_id", company.id)
+          .eq("agent", agent);
+        console.log(`[agent] ${agent} completed`);
+        return { agent, ok: true };
+      } catch (e: any) {
+        console.error(`[agent] ${agent} failed:`, e.message);
+        await supabase
+          .from("agent_assessments")
+          .update({
+            status: "error",
+            summary: `Assessment failed: ${e.message}`,
+            findings: {},
+            risk_score: 50,
+          })
+          .eq("company_id", company.id)
+          .eq("agent", agent);
+        return { agent, ok: false, error: e?.message };
+      }
+    };
+
+    // Batch 1: CFO + COO + Tax (parallel)
+    console.log("[research] Batch 1: CFO, COO, Tax");
+    const batch1 = await Promise.all([
+      runAgent("cfo"),
+      runAgent("coo"),
+      runAgent("tax"),
+    ]);
+
+    // Batch 2: Marketing + BizDev (parallel)
+    console.log("[research] Batch 2: Marketing, BizDev");
+    const batch2 = await Promise.all([
+      runAgent("marketing"),
+      runAgent("bizdev"),
+    ]);
+
+    const results = [...batch1, ...batch2];
 
     await supabase
       .from("companies")
@@ -157,12 +202,30 @@ export const updateCompanyTokenLimit = createServerFn({ method: "POST" })
     z.object({ companyId: z.string().uuid(), limit: z.number().int().nonnegative() }).parse(d),
   )
   .handler(async ({ data, context }) => {
-    const { supabase } = context;
+    const { supabase, userId } = context;
+
+    // Verify ownership
+    const { data: company, error: fetchErr } = await supabase
+      .from("companies")
+      .select("id")
+      .eq("id", data.companyId)
+      .eq("owner_id", userId)
+      .single();
+
+    if (fetchErr || !company) {
+      throw new Error("Company not found or access denied");
+    }
+
     const { error } = await supabase
       .from("companies")
       .update({ token_limit: data.limit })
       .eq("id", data.companyId);
-    if (error) throw new Error(error.message);
+
+    if (error) {
+      console.error("[server] DB error:", error.message);
+      throw new Error("Database operation failed");
+    }
+
     return { ok: true };
   });
 
@@ -172,12 +235,104 @@ export const resetCompanyTokenUsage = createServerFn({ method: "POST" })
     z.object({ companyId: z.string().uuid() }).parse(d),
   )
   .handler(async ({ data, context }) => {
-    const { supabase } = context;
+    const { supabase, userId } = context;
+
+    // Verify ownership
+    const { data: company, error: fetchErr } = await supabase
+      .from("companies")
+      .select("id")
+      .eq("id", data.companyId)
+      .eq("owner_id", userId)
+      .single();
+
+    if (fetchErr || !company) {
+      throw new Error("Company not found or access denied");
+    }
+
     const { error } = await supabase
       .from("companies")
       .update({ token_used: 0 })
       .eq("id", data.companyId);
-    if (error) throw new Error(error.message);
+
+    if (error) {
+      console.error("[server] DB error:", error.message);
+      throw new Error("Database operation failed");
+    }
+
     return { ok: true };
   });
 
+export const rerunSingleAgent = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: { companyId: string; agent: string }) =>
+    z.object({ companyId: z.string().uuid(), agent: z.string() }).parse(d),
+  )
+  .handler(async ({ data, context }) => {
+    const { supabase, userId } = context;
+
+    // Verify ownership
+    const { data: company } = await supabase
+      .from("companies")
+      .select("*")
+      .eq("id", data.companyId)
+      .eq("owner_id", userId)
+      .single();
+
+    if (!company) throw new Error("Company not found or access denied");
+
+    const { data: sources } = await supabase
+      .from("research_sources")
+      .select("url,title,excerpt")
+      .eq("company_id", data.companyId);
+
+    const research = {
+      websiteMarkdown: "",
+      websiteSummary: sources?.find((s: any) => s.url === company.website)?.excerpt || "",
+      searchResults: (sources ?? [])
+        .filter((s: any) => s.url !== company.website)
+        .map((s: any) => ({ url: s.url, title: s.title, description: s.excerpt })),
+    };
+
+    await supabase
+      .from("agent_assessments")
+      .update({ status: "running" })
+      .eq("company_id", data.companyId)
+      .eq("agent", data.agent);
+
+    try {
+      const r = await Promise.race([
+        runAgentAssessment({
+          agent: data.agent as any,
+          companyName: company.name,
+          website: company.website,
+          research,
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`${data.agent} timed out after 120s`)), 120_000)
+        ),
+      ]);
+      await supabase
+        .from("agent_assessments")
+        .update({
+          status: "complete",
+          summary: r.summary,
+          findings: r.findings,
+          risk_score: r.risk_score,
+        })
+        .eq("company_id", data.companyId)
+        .eq("agent", data.agent);
+      return { ok: true };
+    } catch (e: any) {
+      await supabase
+        .from("agent_assessments")
+        .update({
+          status: "error",
+          summary: `Assessment failed: ${e.message}`,
+          findings: {},
+          risk_score: 50,
+        })
+        .eq("company_id", data.companyId)
+        .eq("agent", data.agent);
+      return { ok: false, error: e.message };
+    }
+  });

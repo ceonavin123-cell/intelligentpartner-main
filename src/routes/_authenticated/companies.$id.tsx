@@ -2,11 +2,11 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import React, { useState, useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { getCompanyDetails, runCompanyResearch, updateCompanyTokenLimit, resetCompanyTokenUsage } from "@/lib/companies.functions";
+import { getCompanyDetails, runCompanyResearch, updateCompanyTokenLimit, resetCompanyTokenUsage, rerunSingleAgent } from "@/lib/companies.functions";
 import { createThread, listThreadMessages, sendChatMessage } from "@/lib/chat.functions";
 import { generateStructuredReport, type ReportKind } from "@/lib/reports.functions";
 import { listReportTemplates, deleteReportTemplate } from "@/lib/templates.functions";
-import { uploadCompanyDocument, deleteCompanyDocument } from "@/lib/documents.functions";
+import { uploadCompanyDocument, deleteCompanyDocument, getDocumentChunks } from "@/lib/documents.functions";
 import { getCompanyMemory } from "@/lib/memory.functions";
 import { MemoryDashboard } from "@/components/MemoryDashboard";
 import { Button } from "@/components/ui/button";
@@ -124,14 +124,14 @@ function CompanyWorkspace() {
             </Badge>
           </div>
         </div>
-        <Button variant="outline" onClick={onRerun} disabled={rerunning || company.status === "researching"}>
+        <Button variant="outline" onClick={onRerun} disabled={rerunning}>
           <RefreshCw className={`h-4 w-4 mr-2 ${rerunning ? "animate-spin" : ""}`} />
           Re-run research
         </Button>
       </div>
 
       <Tabs defaultValue="assessment">
-          <TabsList>
+        <TabsList>
           <TabsTrigger value="assessment">Assessment</TabsTrigger>
           <TabsTrigger value="chat">Chat</TabsTrigger>
           <TabsTrigger value="reports">Reports ({reports.length})</TabsTrigger>
@@ -163,13 +163,38 @@ function CompanyWorkspace() {
                       </div>
                       <h3 className="font-semibold text-sm">{meta.name} Agent</h3>
                     </div>
-                    {a?.risk_score != null && <Badge variant="outline">Risk {a.risk_score}</Badge>}
+                    <div className="flex items-center gap-2">
+                      {a?.risk_score != null && <Badge variant="outline">Risk {a.risk_score}</Badge>}
+                      {a && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-7 w-7 p-0"
+                          disabled={a.status === "running"}
+                          onClick={async () => {
+                            try {
+                              await rerunSingleAgent({ data: { companyId: id, agent } });
+                              qc.invalidateQueries({ queryKey: ["company", id] });
+                            } catch (e: any) {
+                              toast.error(e?.message ?? "Re-run failed");
+                            }
+                          }}
+                        >
+                          <RefreshCw className={`h-3 w-3 ${a.status === "running" ? "animate-spin" : ""}`} />
+                        </Button>
+                      )}
+                    </div>
                   </div>
                   {!a ? (
                     <p className="text-xs text-muted-foreground">Not started</p>
                   ) : a.status === "running" ? (
                     <div className="flex items-center text-xs text-muted-foreground">
                       <Brain className="h-3 w-3 mr-1 animate-pulse" /> Researching…
+                    </div>
+                  ) : a.status === "error" ? (
+                    <div className="space-y-1">
+                      <p className="text-xs text-red-500 font-medium">Assessment failed — click Re-run to try again</p>
+                      <p className="text-xs text-muted-foreground">{a.summary}</p>
                     </div>
                   ) : (
                     <>
@@ -588,9 +613,12 @@ function ChatPanel({ company, threads, documents }: { company: any; threads: any
     setInput("");
     stopSpeaking();
     try {
-      await send({ data: { threadId: activeId, message: text } });
+      const result = await send({ data: { threadId: activeId, message: text } });
       qc.invalidateQueries({ queryKey: ["msgs", activeId] });
       qc.invalidateQueries({ queryKey: ["company", companyId] });
+      if ((result as any)?.reportSaved) {
+        toast.success("Report saved! Check the Reports tab.");
+      }
     } catch (e: any) {
       toast.error(e?.message ?? "Send failed");
       setInput(text);

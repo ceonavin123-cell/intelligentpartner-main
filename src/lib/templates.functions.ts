@@ -13,9 +13,9 @@ export const listReportTemplates = createServerFn({ method: "POST" })
       .select("id,slug,label,description,brief,report_type,created_at,company_id")
       .order("created_at", { ascending: false });
 
-    // Filter by company if provided — show company-specific + global (no company_id) templates
+    // Filter by company if provided — show ONLY company-specific templates
     if (data.companyId) {
-      query = query.or(`company_id.is.null,company_id.eq.${data.companyId}`);
+      query = query.eq("company_id", data.companyId);
     }
 
     const { data: templates, error } = await query;
@@ -27,7 +27,23 @@ export const deleteReportTemplate = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((d: { id: string }) => z.object({ id: z.string().uuid() }).parse(d))
   .handler(async ({ data, context }) => {
-    const { error } = await context.supabase.from("report_templates").delete().eq("id", data.id);
-    if (error) throw new Error(error.message);
+    const { supabase, userId } = context;
+
+    const { data: tpl, error: fetchErr } = await supabase
+      .from("report_templates")
+      .select("created_by")
+      .eq("id", data.id)
+      .single();
+
+    if (fetchErr || !tpl || tpl.created_by !== userId) {
+      throw new Error("Template not found or access denied");
+    }
+
+    const { error } = await supabase
+      .from("report_templates")
+      .delete()
+      .eq("id", data.id);
+
+    if (error) throw new Error("Failed to delete template");
     return { ok: true };
   });
